@@ -16,7 +16,7 @@ jobs:
           ref: ${{ inputs.target || 'main' }}
           fetch-depth: 0
           fetch-tags: true
-      - run: gh repo sync -b $BRANCH_NAME
+      - run: cd src/github.com/plejd/nats-io-nats-server && gh repo sync -b $BRANCH_NAME
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BRANCH_NAME: main
