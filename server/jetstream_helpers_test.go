@@ -1599,8 +1599,13 @@ func (c *cluster) waitOnAccount(account string) {
 	for time.Now().Before(expires) {
 		found := true
 		for _, s := range c.servers {
+			s.optsMu.RLock()
+			wantJS := s.opts.JetStream
+			s.optsMu.RUnlock()
 			acc, err := s.fetchAccount(account)
-			found = found && err == nil && acc != nil
+			if found = found && err == nil && acc != nil; wantJS {
+				found = found && acc.JetStreamEnabled()
+			}
 		}
 		if found {
 			return
@@ -2107,6 +2112,14 @@ func checkState(t *testing.T, c *cluster, accountName, streamName string) error 
 	if streamLeader == nil {
 		return fmt.Errorf("no leader found for stream %q", streamName)
 	}
+
+	acc, err := leaderSrv.LookupAccount(accountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream(streamName)
+	require_NoError(t, err)
+
+	cfgReplicas := mset.cfg.Replicas
+	foundReplicas := 1 // We already know the leader.
 	var errs []error
 	for _, srv := range c.servers {
 		if srv == leaderSrv {
@@ -2115,13 +2128,25 @@ func checkState(t *testing.T, c *cluster, accountName, streamName string) error 
 		}
 		if srv.isShuttingDown() {
 			// Skip if shutdown.
+			for _, replica := range streamLeader.Cluster.Replicas {
+				if replica.Name == srv.Name() {
+					foundReplicas++
+					break
+				}
+			}
 			continue
 		}
-		acc, err := srv.LookupAccount(accountName)
-		require_NoError(t, err)
-		stream, err := acc.lookupStream(streamName)
-		require_NoError(t, err)
-		state := stream.state()
+		acc, err = srv.LookupAccount(accountName)
+		if err != nil {
+			continue
+		}
+		mset, err = acc.lookupStream(streamName)
+		if err != nil {
+			continue
+		}
+
+		foundReplicas++
+		state := mset.state()
 
 		if state.Msgs != streamLeader.State.Msgs {
 			err := fmt.Errorf("[%s] Leader %v has %d messages, Follower %v has %d messages",
@@ -2151,6 +2176,10 @@ func checkState(t *testing.T, c *cluster, accountName, streamName string) error 
 			)
 			errs = append(errs, err)
 		}
+	}
+	if cfgReplicas != foundReplicas {
+		err := fmt.Errorf("[%s] Expected %d Replicas, got %d\n", streamName, cfgReplicas, foundReplicas)
+		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
 		return errors.Join(errs...)

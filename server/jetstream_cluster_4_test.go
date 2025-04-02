@@ -604,7 +604,7 @@ func TestJetStreamClusterConsumerPauseTimerFollowsLeader(t *testing.T) {
 			require_Equal(t, isLeader, hasTimer)
 		}
 
-		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "my_consumer"), nil, time.Second)
+		_, err = nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "my_consumer"), nil, maxElectionTimeout)
 		require_NoError(t, err)
 	}
 }
@@ -860,25 +860,37 @@ func TestJetStreamClusterConsumerNRGCleanup(t *testing.T) {
 	require_NoError(t, js.DeleteStream("TEST"))
 
 	// Now make sure we cleaned up the NRG directories for the stream and consumer.
-	var numConsumers, numStreams int
-	for _, s := range c.servers {
-		sd := s.JetStreamConfig().StoreDir
-		nd := filepath.Join(sd, "$SYS", "_js_")
-		f, err := os.Open(nd)
-		require_NoError(t, err)
-		dirs, err := f.ReadDir(-1)
-		require_NoError(t, err)
-		for _, fi := range dirs {
-			if strings.HasPrefix(fi.Name(), "C-") {
-				numConsumers++
-			} else if strings.HasPrefix(fi.Name(), "S-") {
-				numStreams++
+	checkFor(t, 2*time.Second, 500*time.Millisecond, func() error {
+		var numConsumers, numStreams int
+		for _, s := range c.servers {
+			sd := s.JetStreamConfig().StoreDir
+			nd := filepath.Join(sd, "$SYS", "_js_")
+			f, err := os.Open(nd)
+			if err != nil {
+				return err
 			}
+			dirs, err := f.ReadDir(-1)
+			if err != nil {
+				return err
+			}
+			for _, fi := range dirs {
+				if strings.HasPrefix(fi.Name(), "C-") {
+					numConsumers++
+				} else if strings.HasPrefix(fi.Name(), "S-") {
+					numStreams++
+				}
+			}
+			f.Close()
 		}
-		f.Close()
-	}
-	require_Equal(t, numConsumers, 0)
-	require_Equal(t, numStreams, 0)
+
+		if numConsumers != 0 {
+			return fmt.Errorf("expected 0 consumers, got %d", numConsumers)
+		}
+		if numStreams != 0 {
+			return fmt.Errorf("expected 0 streams, got %d", numStreams)
+		}
+		return nil
+	})
 }
 
 // https://github.com/nats-io/nats-server/issues/4878
@@ -1999,7 +2011,7 @@ func TestJetStreamClusterAccountNRG(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond * 100)
 		for _, s := range c.servers {
-			s.GlobalAccount().js.nrgAccount = ""
+			s.GlobalAccount().nrgAccount = ""
 			s.updateNRGAccountStatus()
 		}
 
@@ -2039,9 +2051,9 @@ func TestJetStreamClusterAccountNRG(t *testing.T) {
 		time.Sleep(time.Millisecond * 100)
 		for i, s := range c.servers {
 			if i == 0 {
-				s.GlobalAccount().js.nrgAccount = globalAccountName
+				s.GlobalAccount().nrgAccount = globalAccountName
 			} else {
-				s.GlobalAccount().js.nrgAccount = ""
+				s.GlobalAccount().nrgAccount = ""
 			}
 			s.updateNRGAccountStatus()
 		}
@@ -2080,7 +2092,7 @@ func TestJetStreamClusterAccountNRG(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond * 100)
 		for _, s := range c.servers {
-			s.GlobalAccount().js.nrgAccount = globalAccountName
+			s.GlobalAccount().nrgAccount = globalAccountName
 			s.updateNRGAccountStatus()
 		}
 
@@ -2109,6 +2121,34 @@ func TestJetStreamClusterAccountNRG(t *testing.T) {
 			require_True(t, msg != nil)
 		}
 	})
+}
+
+func TestJetStreamClusterAccountNRGConfigNoPanic(t *testing.T) {
+	clusterConf := `
+		listen: 127.0.0.1:-1
+
+		server_name: %s
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+
+		cluster {
+			name: %s
+			listen: 127.0.0.1:%d
+			routes = [%s]
+		}
+
+		accounts {
+			ONE { jetstream: { cluster_traffic: system } }
+		}
+	`
+
+	cl := createJetStreamClusterWithTemplate(t, clusterConf, "test", 3)
+	defer cl.shutdown()
+
+	for _, s := range cl.servers {
+		acc, err := s.lookupAccount("ONE")
+		require_NoError(t, err)
+		require_Equal(t, acc.nrgAccount, _EMPTY_) // Empty for the system account
+	}
 }
 
 func TestJetStreamClusterWQRoundRobinSubjectRetention(t *testing.T) {
@@ -4427,6 +4467,22 @@ func TestJetStreamClusterStreamAckMsgR3SignalsRemovedMsg(t *testing.T) {
 		return mset, o, nil
 	}
 
+	// Wait for all servers to know about the stream and consumer.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range c.servers {
+			_, _, err = getStreamAndConsumer(s)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Also wait for the published message to be replicated.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
+
 	sl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
 	sf := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
 
@@ -5002,5 +5058,466 @@ func TestJetStreamClusterMessageTTLDisabled(t *testing.T) {
 		stream, err := s.GlobalAccount().lookupStream("TEST")
 		require_NoError(t, err)
 		require_Equal(t, stream.getCLFS(), 0)
+	}
+}
+
+func TestJetStreamClusterCreateStreamPerf(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	for i := 0; i < 10; i++ {
+		// Check that creating a replicated asset doesn't take too long.
+		start := time.Now()
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:      fmt.Sprintf("TEST-%d", i),
+			Retention: nats.LimitsPolicy,
+			Subjects:  []string{fmt.Sprintf("foo.%d", i)},
+			Replicas:  3,
+		})
+		require_NoError(t, err)
+		if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+			t.Skipf("Took too long to create a R3 stream: %v", elapsed)
+		}
+	}
+}
+
+func TestJetStreamClusterTTLAndDedupe(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:      "TEST",
+		Retention: LimitsPolicy,
+		Storage:   FileStorage,
+		Subjects:  []string{"foo"},
+		Replicas:  3,
+	}
+	_, err := jsStreamCreate(t, nc, cfg)
+	require_NoError(t, err)
+
+	m := nats.NewMsg("foo")
+	m.Header.Add(JSMsgId, "msgId")
+	m.Header.Add(JSMessageTTL, "10s")
+	_, err = js.PublishMsg(m)
+	require_Error(t, err, NewJSMessageTTLDisabledError())
+
+	// Retrying should get TTL disabled still, not any other error.
+	_, err = js.PublishMsg(m)
+	require_Error(t, err, NewJSMessageTTLDisabledError())
+
+	// Send without TTL should succeed.
+	m.Header.Del(JSMessageTTL)
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+}
+
+func TestJetStreamClusterInvalidTTLAndDedupe(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	cfg := &StreamConfig{
+		Name:        "TEST",
+		Retention:   LimitsPolicy,
+		Storage:     FileStorage,
+		Subjects:    []string{"foo"},
+		Replicas:    3,
+		AllowMsgTTL: true,
+	}
+	_, err := jsStreamCreate(t, nc, cfg)
+	require_NoError(t, err)
+
+	m := nats.NewMsg("foo")
+	m.Header.Add(JSMsgId, "msgId")
+	m.Header.Add(JSMessageTTL, "invalid!")
+	_, err = js.PublishMsg(m)
+	require_Error(t, err, NewJSMessageTTLInvalidError())
+
+	// Retry with a negative TTL.
+	m.Header.Set(JSMessageTTL, "-10s")
+	_, err = js.PublishMsg(m)
+	require_Error(t, err, NewJSMessageTTLInvalidError())
+
+	// Retrying with valid TTL should be successful, and not be marked as duplicate.
+	m.Header.Set(JSMessageTTL, "10s")
+	_, err = js.PublishMsg(m)
+	require_NoError(t, err)
+}
+
+func TestJetStreamClusterServerPeerRemovePeersDrift(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R4S", 4)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Retention: nats.LimitsPolicy,
+		Subjects:  []string{"foo"},
+		Replicas:  3,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:  "CONSUMER",
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	var acc *Account
+	var mset *stream
+
+	// Wait for 3 of the 4 servers to have created the stream.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		count := 0
+		for _, s := range c.servers {
+			acc, err = s.lookupAccount(globalAccountName)
+			if err != nil {
+				return err
+			}
+			mset, err = acc.lookupStream("TEST")
+			if err != nil {
+				continue
+			}
+			o := mset.lookupConsumer("CONSUMER")
+			if o == nil {
+				continue
+			}
+			count++
+		}
+		if count != 3 {
+			return fmt.Errorf("expected 3 streams/consumers, got: %d", count)
+		}
+		return nil
+	})
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+
+	// Get a random server that:
+	// - is not stream leader
+	// - is not meta leader (peer-removing the meta leader has other issues)
+	// - already hosts the stream so a peer-remove results in changing the stream peer set
+	var rs *Server
+	for _, s := range c.servers {
+		acc, err = s.lookupAccount(globalAccountName)
+		require_NoError(t, err)
+		_, err = acc.lookupStream("TEST")
+		if s == sl || s.isMetaLeader.Load() || err != nil {
+			continue
+		}
+		rs = s
+		break
+	}
+	if rs == nil {
+		t.Fatal("No server found that's not either stream or meta leader.")
+	}
+	rs.Shutdown()
+
+	// Peer-remove the selected server so the stream moves to the remaining empty server.
+	sc, err := nats.Connect(sl.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	req := &JSApiMetaServerRemoveRequest{Server: rs.Name()}
+	jsreq, err := json.Marshal(req)
+	require_NoError(t, err)
+	_, err = sc.Request(JSApiRemoveServer, jsreq, time.Second)
+	require_NoError(t, err)
+
+	// Eventually there should again be a R3 stream and everyone should agree on the peers.
+	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		count := 0
+		var streamPeers []string
+		var consumerPeers []string
+		for _, s := range c.servers {
+			if s == rs {
+				continue
+			}
+			acc, err = s.lookupAccount(globalAccountName)
+			if err != nil {
+				return err
+			}
+			mset, err = acc.lookupStream("TEST")
+			if err != nil {
+				return err
+			}
+			o := mset.lookupConsumer("CONSUMER")
+			if o == nil {
+				return fmt.Errorf("consumer not found on %s", s.Name())
+			}
+			mrn := mset.raftNode().(*raft)
+			mrn.RLock()
+			streamPeerNames := mrn.peerNames()
+			mrn.RUnlock()
+
+			orn := o.raftNode().(*raft)
+			orn.RLock()
+			consumerPeerNames := orn.peerNames()
+			orn.RUnlock()
+
+			slices.Sort(streamPeerNames)
+			slices.Sort(consumerPeerNames)
+			if count == 0 {
+				streamPeers = streamPeerNames
+				consumerPeers = consumerPeerNames
+			} else if !slices.Equal(streamPeers, streamPeerNames) {
+				rsid := rs.NodeName()
+				containsOld := slices.Contains(streamPeers, rsid) || slices.Contains(streamPeerNames, rsid)
+				return fmt.Errorf("no equal stream peers, expected: %v, got: %v, contains old peer (%s): %v", streamPeers, streamPeerNames, rsid, containsOld)
+			} else if !slices.Equal(consumerPeers, consumerPeerNames) {
+				rsid := rs.NodeName()
+				containsOld := slices.Contains(consumerPeers, rsid) || slices.Contains(consumerPeerNames, rsid)
+				return fmt.Errorf("no equal consumer peers, expected: %v, got: %v, contains old peer (%s): %v", consumerPeers, consumerPeerNames, rsid, containsOld)
+			}
+			count++
+		}
+		if count != 3 {
+			return fmt.Errorf("expected 3 servers hosting stream/consumer, got: %d", count)
+		}
+		return nil
+	})
+}
+
+func TestJetStreamClusterObserverNotElectedMetaLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	c.waitOnLeader()
+
+	getMeta := func(s *Server) *raft {
+		if js := s.getJetStream(); js != nil {
+			if mg := js.getMetaGroup(); mg != nil {
+				return mg.(*raft)
+			}
+		}
+		return nil
+	}
+
+	setToObserverAndStepDown := func(s *Server) {
+		if meta := getMeta(s); meta != nil {
+			meta.setObserver(true, extExtended)
+			meta.StepDown()
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	for range 10 {
+		// Pick what will be the new leader since we are going to switch
+		// the 2 other servers to observer mode and make them step down.
+		newLeader := c.randomNonLeader()
+		leader := c.leader()
+
+		var other *Server
+		for _, s := range c.servers {
+			if s != newLeader && s != leader {
+				other = s
+				break
+			}
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Add some random delay before changing state and stepping down.
+			time.Sleep(time.Duration(rand.Intn(25)) * time.Millisecond)
+			setToObserverAndStepDown(other)
+		}()
+		setToObserverAndStepDown(leader)
+		wg.Wait()
+
+		// Wait for the newLeader to really be elected.
+		checkFor(t, 10*time.Second, 50*time.Millisecond, func() error {
+			if !newLeader.JetStreamIsLeader() {
+				return fmt.Errorf("Server %q is still not leader", newLeader)
+			}
+			return nil
+		})
+
+		// Change the observer back to false.
+		for _, s := range []*Server{leader, other} {
+			if meta := getMeta(s); meta != nil {
+				meta.SetObserver(false)
+			}
+		}
+	}
+}
+
+func TestJetStreamClusterParallelCreateRaftGroup(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
+
+	ml := c.leader()
+	sjs := ml.getJetStream()
+	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	require_NotNil(t, sa)
+	acc, err := ml.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	rg, storage := sa.Group, sa.Group.Storage
+	rn := mset.raftNode().(*raft)
+	// Do first half of Stop.
+	require_NotEqual(t, rn.state.Swap(int32(Closed)), int32(Closed))
+
+	var wg sync.WaitGroup
+	var finish sync.WaitGroup
+	wg.Add(2)
+	finish.Add(2)
+
+	var mu sync.Mutex
+	var nodes []RaftNode
+
+	// Call createRaftGroup in parallel.
+	for i := 0; i < 2; i++ {
+		go func() {
+			wg.Done()
+			defer finish.Done()
+			if n, rerr := sjs.createRaftGroup(acc.GetName(), rg, storage, pprofLabels{}); rerr == nil {
+				mu.Lock()
+				nodes = append(nodes, n)
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// Wait for both goroutines, and allow some time for both to have entered createRaftGroup.
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
+
+	// Do second half of Stop while goroutines are in createRaftGroup.
+	rn.leaderState.Store(false)
+	close(rn.quit)
+
+	// Wait for node and goroutines to stop.
+	rn.WaitForStop()
+	finish.Wait()
+
+	// Should only create one new node instance.
+	require_Len(t, len(nodes), 2)
+	require_Equal(t, nodes[0], nodes[1])
+}
+
+func TestJetStreamClusterSubjectDeleteMarkersMinimumTTL(t *testing.T) {
+	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
+		for _, replicas := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/R%d", storageType, replicas), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+
+				_, err := jsStreamCreate(t, nc, &StreamConfig{
+					Name:                   "TEST",
+					Retention:              LimitsPolicy,
+					Subjects:               []string{"foo"},
+					Replicas:               replicas,
+					Storage:                storageType,
+					SubjectDeleteMarkerTTL: 3 * time.Second,
+					AllowMsgTTL:            true,
+				})
+				require_NoError(t, err)
+
+				m := nats.NewMsg("foo")
+				m.Header.Set(JSMessageTTL, "1s")
+				_, err = js.PublishMsg(m)
+				require_NoError(t, err)
+
+				_, err = js.GetMsg("TEST", 1)
+				require_NoError(t, err)
+
+				// After the TTL expires it should still be there, because SubjectDeleteMarkerTTL is the minimum.
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", 1)
+				require_NoError(t, err)
+
+				// Need to wait for the subject delete marker to be placed.
+				time.Sleep(2 * time.Second)
+
+				_, err = js.GetMsg("TEST", 1)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				// Expect a subject delete marker based on per-message TTL.
+				sm, err := js.GetMsg("TEST", 2)
+				require_NoError(t, err)
+				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
+				require_Equal(t, sm.Subject, "foo")
+
+				// Since we have a subject delete marker now with a higher TTL, if this
+				// message's lower TTL would be respected then we would not have a new
+				// subject delete marker when this message expires.
+				pa, err := js.PublishMsg(m)
+				require_NoError(t, err)
+				require_Equal(t, pa.Sequence, 3)
+
+				// After some time the first subject delete marker should be gone, and the new one should be placed.
+				time.Sleep(3500 * time.Millisecond)
+
+				_, err = js.GetMsg("TEST", 2)
+				require_Error(t, err, nats.ErrMsgNotFound)
+
+				sm, err = js.GetMsg("TEST", 4)
+				require_NoError(t, err)
+				require_Equal(t, sm.Header.Get(JSMarkerReason), JSMarkerReasonMaxAge)
+				require_Equal(t, sm.Subject, "foo")
+			})
+		}
+	}
+}
+
+func TestJetStreamClusterSubjectDeleteMarkersNoMsgTTLSet(t *testing.T) {
+	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
+		for _, replicas := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/R%d", storageType, replicas), func(t *testing.T) {
+				c := createJetStreamClusterExplicit(t, "R3S", 3)
+				defer c.shutdown()
+
+				nc, js := jsClientConnect(t, c.randomServer())
+				defer nc.Close()
+
+				_, err := jsStreamCreate(t, nc, &StreamConfig{
+					Name:                   "TEST",
+					Retention:              LimitsPolicy,
+					Subjects:               []string{"foo"},
+					Replicas:               replicas,
+					Storage:                storageType,
+					SubjectDeleteMarkerTTL: time.Second,
+					AllowMsgTTL:            true,
+				})
+				require_NoError(t, err)
+
+				_, err = js.Publish("foo", nil)
+				require_NoError(t, err)
+
+				_, err = js.GetMsg("TEST", 1)
+				require_NoError(t, err)
+
+				// Message should not expire based on SubjectDeleteMarkerTTL if no TTL is set.
+				time.Sleep(1500 * time.Millisecond)
+				_, err = js.GetMsg("TEST", 1)
+				require_NoError(t, err)
+			})
+		}
 	}
 }

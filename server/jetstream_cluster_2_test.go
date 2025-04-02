@@ -192,26 +192,9 @@ func TestJetStreamClusterMultiRestartBug(t *testing.T) {
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$G", "TEST")
 
-	// Create new client.
-	nc, js = jsClientConnect(t, c.randomServer())
-	defer nc.Close()
-
 	// Make sure the replicas are current.
-	js2, err := nc.JetStream(nats.MaxWait(250 * time.Millisecond))
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
-		si, _ := js2.StreamInfo("TEST")
-		if si == nil || si.Cluster == nil {
-			return fmt.Errorf("No stream info or cluster")
-		}
-		for _, pi := range si.Cluster.Replicas {
-			if !pi.Current {
-				return fmt.Errorf("Peer not current: %+v", pi)
-			}
-		}
-		return nil
+	checkFor(t, 10*time.Second, 250*time.Millisecond, func() error {
+		return checkState(t, c, "$G", "TEST")
 	})
 }
 
@@ -1504,7 +1487,7 @@ func TestJetStreamClusterMirrorAndSourceExpiration(t *testing.T) {
 	sendBatch(100)
 	// Need to check both in parallel.
 	scheck, mcheck := uint64(0), uint64(0)
-	checkFor(t, 20*time.Second, 500*time.Millisecond, func() error {
+	checkFor(t, 20*time.Second, 100*time.Millisecond, func() error {
 		if scheck != 100 {
 			if si, _ := js.StreamInfo("S"); si != nil {
 				scheck = si.State.Msgs
@@ -4468,35 +4451,18 @@ func TestJetStreamClusterStreamAndConsumerScaleUpAndDown(t *testing.T) {
 
 	checkSubsPending(t, sub, 3*numMsgs)
 
-	// Make sure cluster replicas are current.
+	// Now check each individual stream on each server to make sure replication occurred.
 	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-		si, err = js.StreamInfo("TEST")
-		require_NoError(t, err)
-		for _, r := range si.Cluster.Replicas {
-			if !r.Current {
-				return fmt.Errorf("Expected replica to be current: %+v", r)
-			}
-		}
-		return nil
-	})
-
-	checkState := func(s *Server) {
-		t.Helper()
-		checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		for _, s := range c.servers {
 			mset, err := s.GlobalAccount().lookupStream("TEST")
 			require_NoError(t, err)
 			state := mset.state()
 			if state.Msgs != uint64(3*numMsgs) || state.FirstSeq != 1 || state.LastSeq != 30 || state.Bytes != 1320 {
 				return fmt.Errorf("Wrong state: %+v for server: %v", state, s)
 			}
-			return nil
-		})
-	}
-
-	// Now check each indidvidual stream on each server to make sure replication occurred.
-	for _, s := range c.servers {
-		checkState(s)
-	}
+		}
+		return nil
+	})
 }
 
 func TestJetStreamClusterInterestRetentionWithFilteredConsumersExtra(t *testing.T) {
@@ -5562,8 +5528,8 @@ func TestJetStreamClusterConsumerOverrides(t *testing.T) {
 	rn.RLock()
 	wal := rn.wal
 	rn.RUnlock()
-	require_True(t, wal.Type() == MemoryStorage)
-	require_True(t, st == MemoryStorage)
+	require_Equal(t, wal.Type(), MemoryStorage)
+	require_Equal(t, st, MemoryStorage)
 
 	// Now make sure we account properly for the consumers.
 	// Add in normal here first.
@@ -5572,7 +5538,7 @@ func TestJetStreamClusterConsumerOverrides(t *testing.T) {
 
 	si, err := js.StreamInfo("TEST")
 	require_NoError(t, err)
-	require_True(t, si.State.Consumers == 3)
+	require_Equal(t, si.State.Consumers, 3)
 
 	err = js.DeleteConsumer("TEST", "d")
 	require_NoError(t, err)
@@ -5583,23 +5549,33 @@ func TestJetStreamClusterConsumerOverrides(t *testing.T) {
 	mset, err = s.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
 
-	state := mset.Store().State()
-	require_True(t, state.Consumers == 2)
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		state := mset.Store().State()
+		if state.Consumers != 2 {
+			return fmt.Errorf("expected 2 consumers, got %d", state.Consumers)
+		}
+		return nil
+	})
 
 	// Fast state version as well.
 	fstate := mset.stateWithDetail(false)
-	require_True(t, fstate.Consumers == 2)
+	require_Equal(t, fstate.Consumers, 2)
 
 	// Make sure delete accounting works too.
 	err = js.DeleteConsumer("TEST", "m")
 	require_NoError(t, err)
 
-	state = mset.Store().State()
-	require_True(t, state.Consumers == 1)
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		state := mset.Store().State()
+		if state.Consumers != 1 {
+			return fmt.Errorf("expected 1 consumer, got %d", state.Consumers)
+		}
+		return nil
+	})
 
 	// Fast state version as well.
 	fstate = mset.stateWithDetail(false)
-	require_True(t, fstate.Consumers == 1)
+	require_Equal(t, fstate.Consumers, 1)
 }
 
 func TestJetStreamClusterStreamRepublish(t *testing.T) {
@@ -7861,6 +7837,258 @@ func TestJetStreamClusterConsumerResetStartingSequenceToAgreedState(t *testing.T
 			msgs, err := sub.Fetch(3, nats.MaxWait(2*time.Second))
 			require_NoError(t, err)
 			require_Len(t, len(msgs), 3)
+		})
+	}
+}
+
+func TestJetStreamClusterSubjectDeleteMarkers(t *testing.T) {
+	for _, storage := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			_, err := jsStreamCreate(t, nc, &StreamConfig{
+				Name:                   "TEST",
+				Storage:                storage,
+				Subjects:               []string{"test"},
+				Replicas:               3,
+				MaxAge:                 time.Second,
+				AllowMsgTTL:            true,
+				SubjectDeleteMarkerTTL: time.Second,
+			})
+			require_NoError(t, err)
+
+			sub, err := js.SubscribeSync("test")
+			require_NoError(t, err)
+
+			for i := 0; i < 3; i++ {
+				_, err = js.Publish("test", nil)
+				require_NoError(t, err)
+			}
+
+			for i := 0; i < 3; i++ {
+				msg, err := sub.NextMsg(time.Second)
+				require_NoError(t, err)
+				require_NoError(t, msg.AckSync())
+			}
+
+			msg, err := sub.NextMsg(time.Second * 10)
+			require_NoError(t, err)
+			require_Equal(t, msg.Header.Get(JSMarkerReason), "MaxAge")
+			require_Equal(t, msg.Header.Get(JSMessageTTL), "1s")
+		})
+	}
+}
+
+func TestJetStreamClusterSubjectDeleteMarkerClusteredProposal(t *testing.T) {
+	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storageType.String(), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			_, err := jsStreamCreate(t, nc, &StreamConfig{
+				Name:                   "TEST",
+				Storage:                storageType,
+				Subjects:               []string{"test"},
+				Replicas:               3,
+				MaxAge:                 3 * time.Second,
+				AllowMsgTTL:            true,
+				SubjectDeleteMarkerTTL: time.Second,
+			})
+			require_NoError(t, err)
+
+			// First message is applied by all replicas.
+			_, err = js.Publish("test", nil)
+			require_NoError(t, err)
+
+			// Wait so MaxAge is applied and a subject delete marker is placed.
+			time.Sleep(4 * time.Second)
+
+			// Second message should be successful and not be influenced by the prior subject delete marker.
+			_, err = js.Publish("test", nil)
+			require_NoError(t, err)
+
+			checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+				return checkState(t, c, globalAccountName, "TEST")
+			})
+		})
+	}
+}
+
+func TestJetStreamClusterSubjectDeleteMarkersTTLRollupWithMaxAge(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	jsStreamCreate(t, nc, &StreamConfig{
+		Name:                   "TEST",
+		Storage:                FileStorage,
+		Replicas:               3,
+		Subjects:               []string{"test"},
+		MaxAge:                 time.Second,
+		AllowMsgTTL:            true,
+		AllowRollup:            true,
+		SubjectDeleteMarkerTTL: time.Second,
+	})
+
+	sub, err := js.SubscribeSync("test")
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		msg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_NoError(t, msg.AckSync())
+	}
+
+	rh := nats.Header{}
+	rh.Set(JSMessageTTL, "2s") // MaxAge will get here first.
+	rh.Set(JSMsgRollup, JSMsgRollupSubject)
+	_, err = js.PublishMsg(&nats.Msg{
+		Subject: "test",
+		Header:  rh,
+	})
+	require_NoError(t, err)
+
+	// Expect to only have the rollup message here.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 1)
+	require_Equal(t, si.State.FirstSeq, 4)
+
+	msg, err := sub.NextMsg(time.Second * 10)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get(JSMsgRollup), JSMsgRollupSubject)
+	require_Equal(t, msg.Header.Get(JSMessageTTL), "2s")
+	meta, err := msg.Metadata()
+	require_NoError(t, err)
+	require_NoError(t, msg.AckSync())
+
+	msg, err = sub.NextMsg(time.Second * 10)
+	require_NoError(t, err)
+	require_LessThan(t, time.Second, time.Since(meta.Timestamp))
+	require_Equal(t, msg.Header.Get(JSMarkerReason), "MaxAge")
+	require_Equal(t, msg.Header.Get(JSMessageTTL), "1s")
+}
+
+func TestJetStreamClusterSubjectDeleteMarkersTTLRollupWithoutMaxAge(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:                   "TEST",
+		Storage:                FileStorage,
+		Replicas:               3,
+		Subjects:               []string{"test"},
+		AllowMsgTTL:            true,
+		AllowRollup:            true,
+		SubjectDeleteMarkerTTL: time.Second,
+	})
+	require_NoError(t, err)
+
+	sub, err := js.SubscribeSync("test")
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		msg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_NoError(t, msg.AckSync())
+	}
+
+	rh := nats.Header{}
+	rh.Set(JSMessageTTL, "1s")
+	rh.Set(JSMsgRollup, JSMsgRollupSubject)
+	_, err = js.PublishMsg(&nats.Msg{
+		Subject: "test",
+		Header:  rh,
+	})
+	require_NoError(t, err)
+
+	// Expect to only have the rollup message here.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 1)
+	require_Equal(t, si.State.FirstSeq, 4)
+
+	msg, err := sub.NextMsg(time.Second * 10)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get(JSMsgRollup), JSMsgRollupSubject)
+	require_Equal(t, msg.Header.Get(JSMessageTTL), "1s")
+	require_NoError(t, msg.AckSync())
+
+	// Wait for the rollup message to hit the TTL.
+	time.Sleep(2500 * time.Millisecond)
+
+	// Now it should be gone, and it will have been replaced with a
+	// subject delete marker (which is also gone by now).
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 0)
+	require_Equal(t, si.State.FirstSeq, 6)
+}
+
+func TestJetStreamClusterSubjectDeleteMarkersTimingWithMaxAge(t *testing.T) {
+	for _, storageType := range []StorageType{FileStorage, MemoryStorage} {
+		t.Run(storageType.String(), func(t *testing.T) {
+			c := createJetStreamClusterExplicit(t, "R3S", 3)
+			defer c.shutdown()
+
+			nc, js := jsClientConnect(t, c.randomServer())
+			defer nc.Close()
+
+			jsStreamCreate(t, nc, &StreamConfig{
+				Name:                   "TEST",
+				Storage:                storageType,
+				Replicas:               3,
+				Subjects:               []string{"test"},
+				AllowMsgTTL:            true,
+				AllowRollup:            true,
+				MaxAge:                 time.Minute,
+				SubjectDeleteMarkerTTL: 1 * time.Second,
+			})
+
+			msg := &nats.Msg{
+				Subject: "test",
+				Header:  nats.Header{},
+			}
+			msg.Header.Set(JSMessageTTL, "1s")
+
+			// We expect each of these messages to age out properly and not for
+			// the timer to stay stuck at the MaxAge interval.
+			for i := 0; i < 3; i++ {
+				_, err := js.PublishMsg(msg)
+				require_NoError(t, err)
+
+				// After TTL a subject delete marker will be placed.
+				time.Sleep(time.Second + 500*time.Millisecond)
+				_, err = js.GetLastMsg("TEST", "test")
+				require_NoError(t, err)
+
+				// It will be expired soon.
+				time.Sleep(time.Second)
+				_, err = js.GetLastMsg("TEST", "test")
+				require_Error(t, err, nats.ErrMsgNotFound)
+			}
 		})
 	}
 }

@@ -289,6 +289,8 @@ const (
 	purgeDir = "__msgs__"
 	// used to scan blk file names.
 	blkScan = "%d.blk"
+	// suffix of a block file
+	blkSuffix = ".blk"
 	// used for compacted blocks that are staged.
 	newScan = "%d.new"
 	// used to scan index file names.
@@ -474,6 +476,10 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		// Check if our prior state remembers a last sequence past where we can see.
 		if fs.ld != nil && prior.LastSeq > fs.state.LastSeq {
 			fs.state.LastSeq, fs.state.LastTime = prior.LastSeq, prior.LastTime
+			if fs.state.Msgs == 0 {
+				fs.state.FirstSeq = fs.state.LastSeq + 1
+				fs.state.FirstTime = time.Time{}
+			}
 			if _, err := fs.newMsgBlockForWrite(); err == nil {
 				if err = fs.writeTombstone(prior.LastSeq, prior.LastTime.UnixNano()); err != nil {
 					return nil, err
@@ -1814,6 +1820,10 @@ func (fs *fileStore) recoverFullState() (rerr error) {
 
 	var index uint32
 	for _, fi := range dirs {
+		// Ensure it's actually a block file, otherwise fmt.Sscanf also matches %d.blk.tmp
+		if !strings.HasSuffix(fi.Name(), blkSuffix) {
+			continue
+		}
 		if n, err := fmt.Sscanf(fi.Name(), blkScan, &index); err == nil && n == 1 {
 			if index > blkIndex {
 				fs.warn("Stream state outdated, found extra blocks, will rebuild")
@@ -2002,6 +2012,10 @@ func (fs *fileStore) recoverMsgs() error {
 	indices := make(sort.IntSlice, 0, len(dirs))
 	var index int
 	for _, fi := range dirs {
+		// Ensure it's actually a block file, otherwise fmt.Sscanf also matches %d.blk.tmp
+		if !strings.HasSuffix(fi.Name(), blkSuffix) {
+			continue
+		}
 		if n, err := fmt.Sscanf(fi.Name(), blkScan, &index); err == nil && n == 1 {
 			indices = append(indices, index)
 		}
@@ -4031,10 +4045,10 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 
 	// Check if we have and need the age expiration timer running.
 	switch {
+	case fs.ttls != nil && ttl > 0:
+		fs.resetAgeChk(0)
 	case fs.ageChk == nil && (fs.cfg.MaxAge > 0 || fs.ttls != nil):
 		fs.startAgeChk()
-	case fs.ageChk != nil && fs.ttls != nil && ttl > 0:
-		fs.resetAgeChk(0)
 	}
 
 	return nil
@@ -5500,20 +5514,22 @@ func (fs *fileStore) subjectDeleteMarkerIfNeeded(subj string, reason string) fun
 		return nil
 	}
 	var _hdr [128]byte
-	hdr := fmt.Appendf(_hdr[:0], "NATS/1.0\r\n%s: %s\r\n%s: %s\r\n\r\n", JSMarkerReason, reason, JSMessageTTL, time.Duration(ttl)*time.Second)
-	seq, ts := fs.state.LastSeq+1, time.Now().UnixNano()
-	// Store it in the stream and then prepare the callbacks
-	// to return to the caller.
-	if err := fs.storeRawMsg(subj, hdr, nil, seq, ts, ttl); err != nil {
-		return nil
+	hdr := fmt.Appendf(
+		_hdr[:0],
+		"NATS/1.0\r\n%s: %s\r\n%s: %s\r\n%s: %d\r\n%s: %s\r\n\r\n\r\n",
+		JSMarkerReason, reason,
+		JSMessageTTL, time.Duration(ttl)*time.Second,
+		JSExpectedLastSubjSeq, 0,
+		JSExpectedLastSubjSeqSubj, subj,
+	)
+	msg := &inMsg{
+		subj: subj,
+		hdr:  hdr,
 	}
-	cb, tcb := fs.scb, fs.sdmcb
+	sdmcb := fs.sdmcb
 	return func() {
-		if cb != nil {
-			cb(1, int64(fileStoreMsgSize(subj, hdr, nil)), seq, subj)
-		}
-		if tcb != nil {
-			tcb(seq, subj)
+		if sdmcb != nil {
+			sdmcb(msg)
 		}
 	}
 }
@@ -8479,6 +8495,20 @@ func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) {
 	}
 
 	ss.Msgs--
+
+	// Only one left.
+	if ss.Msgs == 1 {
+		if !ss.lastNeedsUpdate && seq != ss.Last {
+			ss.First = ss.Last
+			ss.firstNeedsUpdate = false
+			return
+		}
+		if !ss.firstNeedsUpdate && seq != ss.First {
+			ss.Last = ss.First
+			ss.lastNeedsUpdate = false
+			return
+		}
+	}
 
 	// We can lazily calculate the first/last sequence when needed.
 	ss.firstNeedsUpdate = seq == ss.First || ss.firstNeedsUpdate

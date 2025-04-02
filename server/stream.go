@@ -489,10 +489,11 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	}
 
 	// Sensible defaults.
-	cfg, apiErr := s.checkStreamCfg(config, a, pedantic)
+	ccfg, apiErr := s.checkStreamCfg(config, a, pedantic)
 	if apiErr != nil {
 		return nil, apiErr
 	}
+	cfg := &ccfg
 
 	singleServerMode := !s.JetStreamIsClustered() && s.standAloneMode()
 	if singleServerMode && cfg.Replicas > 1 {
@@ -533,7 +534,8 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 			s.setIndexName()
 		}
 
-		if reflect.DeepEqual(ocfg, cfg) {
+		copyStreamMetadata(cfg, &ocfg)
+		if reflect.DeepEqual(cfg, &ocfg) {
 			if sa != nil {
 				mset.setStreamAssignment(sa)
 			}
@@ -547,7 +549,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	jsa.usageMu.RUnlock()
 	reserved := int64(0)
 	if !isClustered {
-		reserved = jsa.tieredReservation(tier, &cfg)
+		reserved = jsa.tieredReservation(tier, cfg)
 	}
 	jsa.mu.Unlock()
 
@@ -556,9 +558,9 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	}
 	js.mu.RLock()
 	if isClustered {
-		_, reserved = tieredStreamAndReservationCount(js.cluster.streams[a.Name], tier, &cfg)
+		_, reserved = tieredStreamAndReservationCount(js.cluster.streams[a.Name], tier, cfg)
 	}
-	if err := js.checkAllLimits(&selected, &cfg, reserved, 0); err != nil {
+	if err := js.checkAllLimits(&selected, cfg, reserved, 0); err != nil {
 		js.mu.RUnlock()
 		return nil, err
 	}
@@ -651,7 +653,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 	mset := &stream{
 		acc:       a,
 		jsa:       jsa,
-		cfg:       cfg,
+		cfg:       *cfg,
 		js:        js,
 		srv:       s,
 		client:    c,
@@ -4113,8 +4115,14 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig) error {
 	}
 	// This will fire the callback but we do not require the lock since md will be 0 here.
 	mset.store.RegisterStorageUpdates(mset.storeUpdates)
-	mset.store.RegisterSubjectDeleteMarkerUpdates(func(seq uint64, subj string) {
-		mset.signalConsumers(subj, seq)
+	mset.store.RegisterSubjectDeleteMarkerUpdates(func(im *inMsg) {
+		if mset.IsClustered() {
+			if mset.IsLeader() {
+				mset.processClusteredInboundMsg(im.subj, im.rply, im.hdr, im.msg, im.mt, false)
+			}
+		} else {
+			mset.processJetStreamMsg(im.subj, im.rply, im.hdr, im.msg, 0, 0, im.mt, false)
+		}
 	})
 	mset.mu.Unlock()
 
@@ -5156,6 +5164,14 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		}
 		mset.mu.Unlock()
 		return err
+	}
+
+	// If subject delete markers are used, ensure message TTL is that at minimum.
+	// Otherwise, subject delete markers could be missed if one already exists for this subject.
+	if ttl > 0 && mset.cfg.SubjectDeleteMarkerTTL > 0 {
+		if minTtl := int64(mset.cfg.SubjectDeleteMarkerTTL.Seconds()); ttl < minTtl {
+			ttl = minTtl
+		}
 	}
 
 	// Store actual msg.
@@ -6408,7 +6424,6 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	if !fcfg.Created.IsZero() {
 		mset.setCreatedTime(fcfg.Created)
 	}
-	lseq := mset.lastSeq()
 
 	// Make sure we do an update if the configs have changed.
 	if !reflect.DeepEqual(fcfg.StreamConfig, cfg) {
@@ -6459,7 +6474,7 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 			obs.setCreatedTime(cfg.Created)
 		}
 		obs.mu.Lock()
-		err = obs.readStoredState(lseq)
+		err = obs.readStoredState()
 		obs.mu.Unlock()
 		if err != nil {
 			mset.stop(true, false)

@@ -5292,12 +5292,14 @@ func TestFileStoreFullStateBasics(t *testing.T) {
 		msgZ := bytes.Repeat([]byte("Z"), msgLen)
 
 		// Send 2 msgs and stop, check for presence of our full state file.
-		fs.StoreMsg(subj, nil, msgA, 0)
-		fs.StoreMsg(subj, nil, msgZ, 0)
-		require_True(t, fs.numMsgBlocks() == 1)
+		_, _, err = fs.StoreMsg(subj, nil, msgA, 0)
+		require_NoError(t, err)
+		_, _, err = fs.StoreMsg(subj, nil, msgZ, 0)
+		require_NoError(t, err)
+		require_Equal(t, fs.numMsgBlocks(), 1)
 
 		// Make sure there is a full state file after we do a stop.
-		fs.Stop()
+		require_NoError(t, fs.Stop())
 
 		sfile := filepath.Join(fcfg.StoreDir, msgDir, streamStreamStateFile)
 		if _, err := os.Stat(sfile); err != nil {
@@ -5317,10 +5319,10 @@ func TestFileStoreFullStateBasics(t *testing.T) {
 		// Make sure there are no old idx or fss files.
 		matches, err := filepath.Glob(filepath.Join(fcfg.StoreDir, msgDir, "%d.fss"))
 		require_NoError(t, err)
-		require_True(t, len(matches) == 0)
+		require_Equal(t, len(matches), 0)
 		matches, err = filepath.Glob(filepath.Join(fcfg.StoreDir, msgDir, "%d.idx"))
 		require_NoError(t, err)
-		require_True(t, len(matches) == 0)
+		require_Equal(t, len(matches), 0)
 
 		state := fs.State()
 		require_Equal(t, state.Msgs, 2)
@@ -5338,10 +5340,11 @@ func TestFileStoreFullStateBasics(t *testing.T) {
 		require_True(t, bytes.Equal(sm.msg, msgZ))
 
 		// Now add in 1 more here to split the lmb.
-		fs.StoreMsg(subj, nil, msgZ, 0)
+		_, _, err = fs.StoreMsg(subj, nil, msgZ, 0)
+		require_NoError(t, err)
 
 		// Now stop the filestore and replace the old stream state and make sure we recover correctly.
-		fs.Stop()
+		require_NoError(t, fs.Stop())
 
 		// Regrab the stream state
 		buf, err = os.ReadFile(sfile)
@@ -5352,8 +5355,9 @@ func TestFileStoreFullStateBasics(t *testing.T) {
 		defer fs.Stop()
 
 		// Add in one more.
-		fs.StoreMsg(subj, nil, msgZ, 0)
-		fs.Stop()
+		_, _, err = fs.StoreMsg(subj, nil, msgZ, 0)
+		require_NoError(t, err)
+		require_NoError(t, fs.Stop())
 
 		// Put old stream state back with only 3.
 		err = os.WriteFile(sfile, buf, defaultFilePerms)
@@ -5381,8 +5385,9 @@ func TestFileStoreFullStateBasics(t *testing.T) {
 		require_Equal(t, psi.lblk, 2)
 
 		// Store 1 more
-		fs.StoreMsg(subj, nil, msgA, 0)
-		fs.Stop()
+		_, _, err = fs.StoreMsg(subj, nil, msgA, 0)
+		require_NoError(t, err)
+		require_NoError(t, fs.Stop())
 		// Put old stream state back with only 3.
 		err = os.WriteFile(sfile, buf, defaultFilePerms)
 		require_NoError(t, err)
@@ -8181,6 +8186,36 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func Benchmark_FileStoreSubjectStateConsistencyOptimizationPerf(b *testing.B) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: b.TempDir()},
+		StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: FileStorage, MaxMsgsPer: 1},
+	)
+	require_NoError(b, err)
+	defer fs.Stop()
+
+	// Do R rounds of storing N messages.
+	// MaxMsgsPer=1, so every unique subject that's placed only exists in the stream once.
+	// If R=2, N=3 that means we'd place foo.0, foo.1, foo.2 in the first round, and the second
+	// round we'd place foo.2, foo.1, foo.0, etc. This is intentional so that without any
+	// optimizations we'd need to scan either 1 in the optimal case or N in the worst case.
+	// Which is way more expensive than always knowing what the sequences are and it being O(1).
+	r := max(2, b.N)
+	n := 40_000
+	b.ResetTimer()
+	for i := 0; i < r; i++ {
+		for j := 0; j < n; j++ {
+			d := j
+			if i%2 == 0 {
+				d = n - j - 1
+			}
+			subject := fmt.Sprintf("foo.%d", d)
+			_, _, err = fs.StoreMsg(subject, nil, nil, 0)
+			require_NoError(b, err)
+		}
+	}
+}
+
 func TestFileStoreWriteFullStateDetectCorruptState(t *testing.T) {
 	fs, err := newFileStore(
 		FileStoreConfig{StoreDir: t.TempDir()},
@@ -8575,6 +8610,12 @@ func TestFileStoreSubjectDeleteMarkers(t *testing.T) {
 	require_NoError(t, err)
 	defer fs.Stop()
 
+	// Capture subject delete marker proposals.
+	ch := make(chan *inMsg, 1)
+	fs.sdmcb = func(im *inMsg) {
+		ch <- im
+	}
+
 	// Store three messages that will expire because of MaxAge.
 	var seq uint64
 	for i := 0; i < 3; i++ {
@@ -8583,75 +8624,15 @@ func TestFileStoreSubjectDeleteMarkers(t *testing.T) {
 	}
 
 	// The last message should be gone after MaxAge has passed.
-	time.Sleep(time.Second * 2)
+	time.Sleep(time.Second + time.Millisecond*500)
 	sm, err := fs.LoadMsg(seq, nil)
 	require_Error(t, err)
 	require_Equal(t, sm, nil)
 
 	// We should have replaced it with a tombstone.
-	sm, err = fs.LoadMsg(seq+1, nil)
-	require_NoError(t, err)
-	require_Equal(t, bytesToString(getHeader(JSMarkerReason, sm.hdr)), JSMarkerReasonMaxAge)
-	require_Equal(t, bytesToString(getHeader(JSMessageTTL, sm.hdr)), "1s")
-
-	time.Sleep(time.Second * 2)
-
-	// The tombstone itself only has a TTL of 1 second so that should
-	// also be gone by now too. No more tombstones should have been
-	// published.
-	var ss StreamState
-	fs.FastState(&ss)
-	require_Equal(t, ss.FirstSeq, sm.seq+1)
-	require_Equal(t, ss.LastSeq, sm.seq)
-	require_Equal(t, ss.Msgs, 0)
-}
-
-func TestFileStoreSubjectDeleteMarkersOnRestart(t *testing.T) {
-	storeDir := t.TempDir()
-	fs, err := newFileStore(
-		FileStoreConfig{StoreDir: storeDir},
-		StreamConfig{
-			Name: "zzz", Subjects: []string{"test"}, Storage: FileStorage,
-			MaxAge: time.Second, AllowMsgTTL: true,
-			SubjectDeleteMarkerTTL: time.Second,
-		},
-	)
-	require_NoError(t, err)
-	defer fs.Stop()
-
-	// Store three messages that will expire because of MaxAge.
-	var seq uint64
-	for i := 0; i < 3; i++ {
-		seq, _, err = fs.StoreMsg("test", nil, nil, 0)
-		require_NoError(t, err)
-	}
-
-	// Stop the store so that the expiry happens while it's technically
-	// offline. Then wait for at least MaxAge and then restart, which should
-	// hit the expireMsgsOnRecover path instead.
-	require_NoError(t, fs.Stop())
-	time.Sleep(time.Second * 2)
-	fs, err = newFileStore(
-		FileStoreConfig{StoreDir: storeDir},
-		StreamConfig{
-			Name: "zzz", Subjects: []string{"test"}, Storage: FileStorage,
-			MaxAge: time.Second, AllowMsgTTL: true,
-			SubjectDeleteMarkerTTL: time.Second,
-		},
-	)
-	require_NoError(t, err)
-	defer fs.Stop()
-
-	// The last message should be gone after MaxAge has passed.
-	sm, err := fs.LoadMsg(seq, nil)
-	require_Error(t, err)
-	require_Equal(t, sm, nil)
-
-	// We should have replaced it with a tombstone.
-	sm, err = fs.LoadMsg(seq+1, nil)
-	require_NoError(t, err)
-	require_Equal(t, bytesToString(getHeader(JSMarkerReason, sm.hdr)), JSMarkerReasonMaxAge)
-	require_Equal(t, bytesToString(getHeader(JSMessageTTL, sm.hdr)), "1s")
+	im := require_ChanRead(t, ch, time.Second*5)
+	require_Equal(t, bytesToString(getHeader(JSMarkerReason, im.hdr)), JSMarkerReasonMaxAge)
+	require_Equal(t, bytesToString(getHeader(JSMessageTTL, im.hdr)), "1s")
 }
 
 func TestFileStoreSubjectDeleteMarkersOnPurge(t *testing.T) {
@@ -8951,4 +8932,67 @@ func TestFileStoreLeftoverSkipMsgInDmap(t *testing.T) {
 	require_Equal(t, fseq, 2)
 	require_Equal(t, lseq, 1)
 	require_Len(t, dmaps, 0)
+}
+
+func TestFileStoreRecoverOnlyBlkFiles(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}, Storage: FileStorage}
+		created := time.Now()
+		fs, err := newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		_, _, err = fs.StoreMsg("foo", nil, nil, 0)
+		require_NoError(t, err)
+
+		// Confirm state as baseline.
+		before := fs.State()
+		require_Equal(t, before.Msgs, 1)
+		require_Equal(t, before.FirstSeq, 1)
+		require_Equal(t, before.LastSeq, 1)
+
+		// Restart should equal state.
+		require_NoError(t, fs.Stop())
+		fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		if state := fs.State(); !reflect.DeepEqual(state, before) {
+			t.Fatalf("Expected state of %+v, got %+v", before, state)
+		}
+
+		// Stream state should exist.
+		_, err = os.Stat(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile))
+		require_NoError(t, err)
+
+		// Stop and write some random files, but containing ".blk", should be ignored.
+		require_NoError(t, fs.Stop())
+		require_NoError(t, os.WriteFile(filepath.Join(fs.fcfg.StoreDir, msgDir, "10.blk.random"), nil, defaultFilePerms))
+		require_NoError(t, os.WriteFile(filepath.Join(fs.fcfg.StoreDir, msgDir, fmt.Sprintf("10.blk.%s", compressTmpSuffix)), nil, defaultFilePerms))
+
+		fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// The random files would previously result in stream state to be deleted.
+		_, err = os.Stat(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile))
+		require_NoError(t, err)
+
+		if state := fs.State(); !reflect.DeepEqual(state, before) {
+			t.Fatalf("Expected state of %+v, got %+v", before, state)
+		}
+
+		// Stop and remove stream state file.
+		require_NoError(t, fs.Stop())
+		require_NoError(t, os.Remove(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)))
+
+		// Recovering based on blocks should also ignore the random files.
+		fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		if state := fs.State(); !reflect.DeepEqual(state, before) {
+			t.Fatalf("Expected state of %+v, got %+v", before, state)
+		}
+	})
 }

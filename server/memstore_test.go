@@ -1199,6 +1199,12 @@ func TestMemStoreSubjectDeleteMarkers(t *testing.T) {
 	require_NoError(t, err)
 	defer fs.Stop()
 
+	// Capture subject delete marker proposals.
+	ch := make(chan *inMsg, 1)
+	fs.sdmcb = func(im *inMsg) {
+		ch <- im
+	}
+
 	// Store three messages that will expire because of MaxAge.
 	var seq uint64
 	for i := 0; i < 3; i++ {
@@ -1207,27 +1213,15 @@ func TestMemStoreSubjectDeleteMarkers(t *testing.T) {
 	}
 
 	// The last message should be gone after MaxAge has passed.
-	time.Sleep(time.Second * 2)
+	time.Sleep(time.Second + time.Millisecond*500)
 	sm, err := fs.LoadMsg(seq, nil)
 	require_Error(t, err)
 	require_Equal(t, sm, nil)
 
 	// We should have replaced it with a tombstone.
-	sm, err = fs.LoadMsg(seq+1, nil)
-	require_NoError(t, err)
-	require_Equal(t, bytesToString(getHeader(JSMarkerReason, sm.hdr)), JSMarkerReasonMaxAge)
-	require_Equal(t, bytesToString(getHeader(JSMessageTTL, sm.hdr)), "1s")
-
-	time.Sleep(time.Second * 2)
-
-	// The tombstone itself only has a TTL of 1 second so that should
-	// also be gone by now too. No more tombstones should have been
-	// published.
-	var ss StreamState
-	fs.FastState(&ss)
-	require_Equal(t, ss.FirstSeq, sm.seq+1)
-	require_Equal(t, ss.LastSeq, sm.seq)
-	require_Equal(t, ss.Msgs, 0)
+	im := require_ChanRead(t, ch, time.Second*5)
+	require_Equal(t, bytesToString(getHeader(JSMarkerReason, im.hdr)), JSMarkerReasonMaxAge)
+	require_Equal(t, bytesToString(getHeader(JSMessageTTL, im.hdr)), "1s")
 }
 
 func TestMemStoreSubjectDeleteMarkersOnPurge(t *testing.T) {
@@ -1440,6 +1434,34 @@ func Benchmark_MemStoreNumPendingWithLargeInteriorDeletesExclude(b *testing.B) {
 		total, _ := ms.NumPending(400_000, "foo.*.baz", false)
 		if total != 1 {
 			b.Fatalf("Expected total of 2 got %d", total)
+		}
+	}
+}
+
+func Benchmark_MemStoreSubjectStateConsistencyOptimizationPerf(b *testing.B) {
+	cfg := &StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, Storage: MemoryStorage, MaxMsgsPer: 1}
+	ms, err := newMemStore(cfg)
+	require_NoError(b, err)
+	defer ms.Stop()
+
+	// Do R rounds of storing N messages.
+	// MaxMsgsPer=1, so every unique subject that's placed only exists in the stream once.
+	// If R=2, N=3 that means we'd place foo.0, foo.1, foo.2 in the first round, and the second
+	// round we'd place foo.2, foo.1, foo.0, etc. This is intentional so that without any
+	// optimizations we'd need to scan either 1 in the optimal case or N in the worst case.
+	// Which is way more expensive than always knowing what the sequences are and it being O(1).
+	r := max(2, b.N)
+	n := 40_000
+	b.ResetTimer()
+	for i := 0; i < r; i++ {
+		for j := 0; j < n; j++ {
+			d := j
+			if i%2 == 0 {
+				d = n - j - 1
+			}
+			subject := fmt.Sprintf("foo.%d", d)
+			_, _, err = ms.StoreMsg(subject, nil, nil, 0)
+			require_NoError(b, err)
 		}
 	}
 }

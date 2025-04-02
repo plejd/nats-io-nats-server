@@ -1459,13 +1459,20 @@ func TestLeafNodePubAllowedPruning(t *testing.T) {
 	for i := 0; i < gr; i++ {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 100; i++ {
+			for j := 0; j < 100; j++ {
 				c.pubAllowed(nats.NewInbox())
 			}
 		}()
 	}
 
 	wg.Wait()
+	// The cache prune function does try for a bit to make sure the cache
+	// is below the maxPermCacheSize value, but depending on the machine
+	// this runs on, it may be that it is still a bit over. If so, run
+	// pubAllowed one more time and we must get below.
+	if n := int(atomic.LoadInt32(&c.perms.pcsz)); n > maxPermCacheSize {
+		c.pubAllowed(nats.NewInbox())
+	}
 	if n := int(atomic.LoadInt32(&c.perms.pcsz)); n > maxPermCacheSize {
 		t.Fatalf("Expected size to be less than %v, got %v", maxPermCacheSize, n)
 	}
@@ -7035,9 +7042,12 @@ func TestLeafNodeCompressionOptions(t *testing.T) {
 			if !reflect.DeepEqual(test.rtts, o.LeafNode.Compression.RTTThresholds) {
 				t.Fatalf("Expected RTT tresholds to be %+v, got %+v", test.rtts, o.LeafNode.Compression.RTTThresholds)
 			}
+			port := s.getOpts().Port
+			leafNodePort := s.getOpts().LeafNode.Port
 			s.Shutdown()
 
-			o.LeafNode.Port = -1
+			o.Port = port
+			o.LeafNode.Port = leafNodePort
 			o.LeafNode.Compression.Mode = test.mode
 			if len(test.rttVals) > 0 {
 				o.LeafNode.Compression.Mode = CompressionS2Auto
@@ -7139,9 +7149,12 @@ func TestLeafNodeCompressionOptions(t *testing.T) {
 			if !reflect.DeepEqual(test.rtts, r.Compression.RTTThresholds) {
 				t.Fatalf("Expected RTT tresholds to be %+v, got %+v", test.rtts, r.Compression.RTTThresholds)
 			}
+			port := s.getOpts().Port
+			leafNodePort := s.getOpts().LeafNode.Port
 			s.Shutdown()
 
-			o.LeafNode.Port = -1
+			o.Port = port
+			o.LeafNode.Port = leafNodePort
 			o.LeafNode.Remotes[0].Compression.Mode = test.mode
 			if len(test.rttVals) > 0 {
 				o.LeafNode.Remotes[0].Compression.Mode = CompressionS2Auto
@@ -8507,12 +8520,15 @@ func TestLeafNodeWithWeightedDQRequestsToSuperClusterWithStreamImportAccounts(t 
 	}
 	nc.Flush()
 
+	// Drain can lose some messages since it only checks pending messages known to the client,
+	// and is not aware of other messages that are inflight on other servers.
+	numMin := num * 99 / 100
 	checkFor(t, time.Second, 200*time.Millisecond, func() error {
 		total := int(r1.Load() + r2.Load())
-		if total == num {
+		if total >= numMin {
 			return nil
 		}
-		return fmt.Errorf("Not all received: %d vs %d", total, num)
+		return fmt.Errorf("Not all received: %d vs %d (minimum %d)", total, num, numMin)
 	})
 	require_True(t, r2.Load() > r1.Load())
 

@@ -324,9 +324,9 @@ func TestJetStreamAutoTuneFSConfig(t *testing.T) {
 
 	acc := s.GlobalAccount()
 
-	testBlkSize := func(subject string, maxMsgs, maxBytes int64, expectedBlkSize uint64) {
+	testBlkSize := func(name string, maxMsgs, maxBytes int64, expectedBlkSize uint64) {
 		t.Helper()
-		mset, err := acc.addStream(streamConfig(subject, maxMsgs, maxBytes))
+		mset, err := acc.addStream(streamConfig(name, maxMsgs, maxBytes))
 		if err != nil {
 			t.Fatalf("Unexpected error adding stream: %v", err)
 		}
@@ -339,6 +339,10 @@ func TestJetStreamAutoTuneFSConfig(t *testing.T) {
 			t.Fatalf("Expected auto tuned block size to be %d, got %d", expectedBlkSize, fsCfg.BlockSize)
 		}
 	}
+
+	// Create a dummy stream, to ensure removing stream/account directories don't race.
+	_, err := acc.addStream(streamConfig("dummy", 1, 0))
+	require_NoError(t, err)
 
 	testBlkSize("foo", 1, 0, FileStoreMinBlkSize)
 	testBlkSize("foo", 1, 512, FileStoreMinBlkSize)
@@ -9819,6 +9823,8 @@ func TestJetStreamAckExplicitMsgRemoval(t *testing.T) {
 			newSub2, err := nc2.SubscribeSync(nats.NewInbox())
 			require_NoError(t, err)
 			defer newSub2.Unsubscribe()
+			err = nc2.Flush()
+			require_NoError(t, err)
 
 			// Update the second durable consumer with the new inbox subscription
 			dc2, err = mset.addConsumer(&ConsumerConfig{
@@ -16863,11 +16869,17 @@ func TestJetStreamImportReload(t *testing.T) {
 	require_NoError(t, err)
 
 	require_NoError(t, ncA.Publish("news.article", nil))
-	require_NoError(t, ncA.Flush())
 
-	si, err := jsB.StreamInfo("news")
-	require_NoError(t, err)
-	require_True(t, si.State.Msgs == 1)
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		si, err := jsB.StreamInfo("news")
+		if err != nil {
+			return err
+		}
+		if si.State.Msgs != 1 {
+			return fmt.Errorf("require uint64 equal, but got: %d != 1", si.State.Msgs)
+		}
+		return nil
+	})
 
 	// Remove exports/imports
 	reloadUpdateConfig(t, s, conf, fmt.Sprintf(`
@@ -16886,9 +16898,9 @@ func TestJetStreamImportReload(t *testing.T) {
 	require_NoError(t, ncA.Publish("news.article", nil))
 	require_NoError(t, ncA.Flush())
 
-	si, err = jsB.StreamInfo("news")
+	si, err := jsB.StreamInfo("news")
 	require_NoError(t, err)
-	require_True(t, si.State.Msgs == 1)
+	require_Equal(t, si.State.Msgs, 1)
 }
 
 func TestJetStreamRecoverSealedAfterServerRestart(t *testing.T) {
@@ -18150,19 +18162,22 @@ func TestJetStreamConsumerPullConsumerFIFO(t *testing.T) {
 		require_NoError(t, err)
 	}
 
+	// Not all core publishes could have made it to the leader yet, wait for some time.
+	time.Sleep(100 * time.Millisecond)
+
 	// Now send 100 messages.
 	for i := 0; i < 100; i++ {
-		js.PublishAsync("T", []byte("FIFO FTW!"))
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
+		_, err = js.Publish("T", []byte("FIFO FTW!"))
+		require_NoError(t, err)
 	}
 
 	// Wait for messages
-	for index, sub := range subs {
+	for _, sub := range subs {
 		checkSubsPending(t, sub, 10)
+	}
+
+	// Confirm FIFO
+	for index, sub := range subs {
 		for i := 0; i < 10; i++ {
 			m, err := sub.NextMsg(time.Second)
 			require_NoError(t, err)
@@ -20342,24 +20357,28 @@ func TestJetStreamConsumerMultipleSubjectsAck(t *testing.T) {
 	msg, err := consumer.Fetch(3)
 	require_NoError(t, err)
 
-	require_True(t, len(msg) == 3)
+	require_Len(t, len(msg), 3)
 
 	require_NoError(t, msg[0].AckSync())
 	require_NoError(t, msg[1].AckSync())
 
-	info, err := js.ConsumerInfo("deliver", "name")
-	require_NoError(t, err)
-
-	if info.AckFloor.Consumer != 2 {
-		t.Fatalf("bad consumer sequence. expected %v, got %v", 2, info.AckFloor.Consumer)
-	}
-	if info.AckFloor.Stream != 2 {
-		t.Fatalf("bad stream sequence. expected %v, got %v", 2, info.AckFloor.Stream)
-	}
-	if info.NumPending != 4 {
-		t.Fatalf("bad num pending. Expected %v, got %v", 2, info.NumPending)
-	}
-
+	// Due to consumer signaling it might not immediately be reflected.
+	checkFor(t, time.Second, 100*time.Millisecond, func() error {
+		info, err := js.ConsumerInfo("deliver", "name")
+		if err != nil {
+			return err
+		}
+		if info.AckFloor.Consumer != 2 {
+			return fmt.Errorf("bad consumer sequence. expected %v, got %v", 2, info.AckFloor.Consumer)
+		}
+		if info.AckFloor.Stream != 2 {
+			return fmt.Errorf("bad stream sequence. expected %v, got %v", 2, info.AckFloor.Stream)
+		}
+		if info.NumPending != 4 {
+			return fmt.Errorf("bad num pending. Expected %v, got %v", 4, info.NumPending)
+		}
+		return nil
+	})
 }
 
 func TestJetStreamConsumerMultipleSubjectAndNewAPI(t *testing.T) {
@@ -25410,6 +25429,184 @@ func TestJetStreamSubjectDeleteMarkers(t *testing.T) {
 	}
 }
 
+func TestJetStreamSubjectDeleteMarkersAfterRestart(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:                   "TEST",
+		Storage:                FileStorage,
+		Subjects:               []string{"test"},
+		MaxAge:                 time.Second,
+		AllowMsgTTL:            true,
+		SubjectDeleteMarkerTTL: time.Second,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:      "test_consumer",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	sd := s.JetStreamConfig().StoreDir
+	s.Shutdown()
+
+	s = RunJetStreamServerOnPort(-1, sd)
+	defer s.Shutdown()
+
+	nc, js = jsClientConnect(t, s)
+	defer nc.Close()
+
+	sub, err := js.PullSubscribe("test", _EMPTY_, nats.Bind("TEST", "test_consumer"))
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		msgs, err := sub.Fetch(1)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+		require_NoError(t, msgs[0].AckSync())
+	}
+
+	msgs, err := sub.Fetch(1)
+	require_NoError(t, err)
+	require_Len(t, len(msgs), 1)
+	require_Equal(t, msgs[0].Header.Get(JSMarkerReason), "MaxAge")
+	require_Equal(t, msgs[0].Header.Get(JSMessageTTL), "1s")
+}
+
+func TestJetStreamSubjectDeleteMarkersTTLRollupWithMaxAge(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	jsStreamCreate(t, nc, &StreamConfig{
+		Name:                   "TEST",
+		Storage:                FileStorage,
+		Subjects:               []string{"test"},
+		MaxAge:                 time.Second,
+		AllowMsgTTL:            true,
+		AllowRollup:            true,
+		SubjectDeleteMarkerTTL: time.Second,
+	})
+
+	sub, err := js.SubscribeSync("test")
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		msg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_NoError(t, msg.AckSync())
+	}
+
+	rh := nats.Header{}
+	rh.Set(JSMessageTTL, "2s") // MaxAge will get here first.
+	rh.Set(JSMsgRollup, JSMsgRollupSubject)
+	_, err = js.PublishMsg(&nats.Msg{
+		Subject: "test",
+		Header:  rh,
+	})
+	require_NoError(t, err)
+
+	// Expect to only have the rollup message here.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 1)
+	require_Equal(t, si.State.FirstSeq, 4)
+
+	msg, err := sub.NextMsg(time.Second * 10)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get(JSMsgRollup), JSMsgRollupSubject)
+	require_Equal(t, msg.Header.Get(JSMessageTTL), "2s")
+	meta, err := msg.Metadata()
+	require_NoError(t, err)
+	require_NoError(t, msg.AckSync())
+
+	msg, err = sub.NextMsg(time.Second * 10)
+	require_NoError(t, err)
+	require_LessThan(t, time.Second, time.Since(meta.Timestamp))
+	require_Equal(t, msg.Header.Get(JSMarkerReason), "MaxAge")
+	require_Equal(t, msg.Header.Get(JSMessageTTL), "1s")
+}
+
+func TestJetStreamSubjectDeleteMarkersTTLRollupWithoutMaxAge(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:                   "TEST",
+		Storage:                FileStorage,
+		Subjects:               []string{"test"},
+		AllowMsgTTL:            true,
+		AllowRollup:            true,
+		SubjectDeleteMarkerTTL: time.Second,
+	})
+	require_NoError(t, err)
+
+	sub, err := js.SubscribeSync("test")
+	require_NoError(t, err)
+
+	for i := 0; i < 3; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	for i := 0; i < 3; i++ {
+		msg, err := sub.NextMsg(time.Second)
+		require_NoError(t, err)
+		require_NoError(t, msg.AckSync())
+	}
+
+	rh := nats.Header{}
+	rh.Set(JSMessageTTL, "1s")
+	rh.Set(JSMsgRollup, JSMsgRollupSubject)
+	_, err = js.PublishMsg(&nats.Msg{
+		Subject: "test",
+		Header:  rh,
+	})
+	require_NoError(t, err)
+
+	// Expect to only have the rollup message here.
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 1)
+	require_Equal(t, si.State.FirstSeq, 4)
+
+	msg, err := sub.NextMsg(time.Second * 10)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get(JSMsgRollup), JSMsgRollupSubject)
+	require_Equal(t, msg.Header.Get(JSMessageTTL), "1s")
+	require_NoError(t, msg.AckSync())
+
+	// Wait for the rollup message to hit the TTL.
+	time.Sleep(2500 * time.Millisecond)
+
+	// Now it should be gone, and it will have been replaced with a
+	// subject delete marker (which is also gone by now).
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 0)
+	require_Equal(t, si.State.FirstSeq, 6)
+}
+
 func TestJetStreamSubjectDeleteMarkersWithMirror(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -25653,5 +25850,277 @@ func TestJetStreamInterestMaxDeliveryReached(t *testing.T) {
 				require_Equal(t, nfo.State.Msgs, uint64(1))
 			})
 		}
+	}
+}
+
+func TestJetStreamRecoversStreamFirstSeqWhenNotEmpty(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Storage:   nats.FileStorage,
+		Subjects:  []string{"test"},
+		Retention: nats.InterestPolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Name:          "CONSUMER",
+		FilterSubject: "test",
+		AckPolicy:     nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	for i := 0; i < 1000; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 1000)
+	require_Equal(t, si.State.FirstSeq, 1)
+	require_Equal(t, si.State.LastSeq, 1000)
+
+	ps, err := js.PullSubscribe("test", "", nats.Bind("TEST", "CONSUMER"))
+	require_NoError(t, err)
+
+	for i := 0; i < 500; i++ {
+		msgs, err := ps.Fetch(1)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+		require_NoError(t, msgs[0].AckSync())
+	}
+
+	ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+	require_NoError(t, err)
+	require_Equal(t, ci.AckFloor.Stream, 500)
+
+	s.shutdownJetStream()
+
+	path := filepath.Join(s.opts.StoreDir, "jetstream", globalAccountName, "streams", "TEST", msgDir)
+	dir, err := os.ReadDir(path)
+	require_NoError(t, err)
+
+	// Mangle the last message in the block so that it fails the checksum comparison
+	// with index.db, which causes us to throw the prior state error and rebuild.
+	// Once this is done we should still be able to figure out what the previous first
+	// and last sequence were, even without messages.
+	for _, f := range dir {
+		if !strings.HasSuffix(f.Name(), ".blk") {
+			continue
+		}
+		st, err := f.Info()
+		require_NoError(t, err)
+		require_NoError(t, os.Truncate(filepath.Join(path, f.Name()), st.Size()-1))
+	}
+
+	s.restartJetStream()
+
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 500)
+	require_Equal(t, si.State.FirstSeq, 501)
+	require_Equal(t, si.State.LastSeq, 1000)
+}
+
+func TestJetStreamRecoversStreamFirstSeqWhenEmpty(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Storage:   nats.FileStorage,
+		Subjects:  []string{"test"},
+		Retention: nats.InterestPolicy,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER"})
+	require_NoError(t, err)
+
+	for i := 0; i < 1000; i++ {
+		_, err = js.Publish("test", nil)
+		require_NoError(t, err)
+	}
+
+	require_NoError(t, js.PurgeStream("TEST"))
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 0)
+	require_Equal(t, si.State.FirstSeq, 1001)
+	require_Equal(t, si.State.LastSeq, 1000)
+
+	ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+	require_NoError(t, err)
+	require_Equal(t, ci.AckFloor.Stream, 1000)
+
+	s.shutdownJetStream()
+
+	path := filepath.Join(s.opts.StoreDir, "jetstream", globalAccountName, "streams", "TEST", msgDir)
+	dir, err := os.ReadDir(path)
+	require_NoError(t, err)
+
+	// Mangle the last message in the block so that it fails the checksum comparison
+	// with index.db, which causes us to throw the prior state error and rebuild.
+	// Once this is done we should still be able to figure out what the previous first
+	// and last sequence were, even without messages.
+	for _, f := range dir {
+		if !strings.HasSuffix(f.Name(), ".blk") {
+			continue
+		}
+		st, err := f.Info()
+		require_NoError(t, err)
+		require_NoError(t, os.Truncate(filepath.Join(path, f.Name()), st.Size()-1))
+	}
+
+	s.restartJetStream()
+
+	si, err = js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 0)
+	require_Equal(t, si.State.FirstSeq, 1001)
+	require_Equal(t, si.State.LastSeq, 1000)
+}
+
+func TestJetStreamUpgradeStreamVersioning(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+
+	// Create stream config.
+	cfg, apiErr := s.checkStreamCfg(&StreamConfig{Name: "TEST", Subjects: []string{"foo"}}, acc, false)
+	require_True(t, apiErr == nil)
+
+	// Create stream.
+	mset, err := acc.addStream(&cfg)
+	require_NoError(t, err)
+	require_True(t, mset.cfg.Metadata == nil)
+
+	for _, create := range []bool{true, false} {
+		title := "create"
+		if !create {
+			title = "update"
+		}
+		t.Run(title, func(t *testing.T) {
+			if create {
+				// Create on 2.11+ should be idempotent with previous create on 2.10-.
+				mcfg := &StreamConfig{}
+				setStaticStreamMetadata(mcfg)
+				si, err := js.AddStream(&nats.StreamConfig{
+					Name:     "TEST",
+					Subjects: []string{"foo"},
+					Metadata: setDynamicStreamMetadata(mcfg).Metadata,
+				})
+				require_NoError(t, err)
+				deleteDynamicMetadata(si.Config.Metadata)
+				require_Len(t, len(si.Config.Metadata), 0)
+			} else {
+				// Update populates the versioning metadata.
+				si, err := js.UpdateStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+				require_NoError(t, err)
+				require_Len(t, len(si.Config.Metadata), 3)
+			}
+		})
+	}
+}
+
+func TestJetStreamUpgradeConsumerVersioning(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:      "TEST",
+		Subjects:  []string{"foo"},
+		Retention: nats.LimitsPolicy,
+		Replicas:  1,
+	})
+	require_NoError(t, err)
+
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Create consumer config.
+	cfg := &ConsumerConfig{Durable: "CONSUMER"}
+	selectedLimits, _, _, apiErr := acc.selectLimits(cfg.replicas(&mset.cfg))
+	if apiErr != nil {
+		require_NoError(t, apiErr)
+	}
+	srvLim := &s.getOpts().JetStreamLimits
+	apiErr = setConsumerConfigDefaults(cfg, &mset.cfg, srvLim, selectedLimits, false)
+	if apiErr != nil {
+		require_NoError(t, apiErr)
+	}
+
+	// Create consumer.
+	_, err = mset.addConsumer(cfg)
+	require_NoError(t, err)
+
+	for _, create := range []bool{true, false} {
+		title := "create"
+		if !create {
+			title = "update"
+		}
+		t.Run(title, func(t *testing.T) {
+			createConsumerRequest := func(obsReq CreateConsumerRequest) (*JSApiConsumerInfoResponse, error) {
+				req, err := json.Marshal(obsReq)
+				if err != nil {
+					return nil, err
+				}
+				msg, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, "TEST", "CONSUMER"), req, time.Second)
+				if err != nil {
+					return nil, err
+				}
+				var resp JSApiConsumerInfoResponse
+				require_NoError(t, json.Unmarshal(msg.Data, &resp))
+				if resp.Error != nil {
+					return nil, resp.Error
+				}
+				return &resp, nil
+			}
+
+			if create {
+				// Create on 2.11+ should be idempotent with previous create on 2.10-.
+				ncfg := &ConsumerConfig{Durable: "CONSUMER"}
+				setStaticConsumerMetadata(ncfg)
+				obsReq := CreateConsumerRequest{
+					Stream: "TEST",
+					Config: *setDynamicConsumerMetadata(ncfg),
+					Action: ActionCreate,
+				}
+				resp, err := createConsumerRequest(obsReq)
+				require_NoError(t, err)
+				deleteDynamicMetadata(resp.Config.Metadata)
+				require_Len(t, len(resp.Config.Metadata), 0)
+			} else {
+				// Update populates the versioning metadata.
+				obsReq := CreateConsumerRequest{
+					Stream: "TEST",
+					Config: ConsumerConfig{Durable: "CONSUMER"},
+					Action: ActionUpdate,
+				}
+				resp, err := createConsumerRequest(obsReq)
+				require_NoError(t, err)
+				require_Len(t, len(resp.Config.Metadata), 3)
+			}
+		})
 	}
 }

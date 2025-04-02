@@ -2064,6 +2064,15 @@ func TestServerEventsHealthZSingleServer(t *testing.T) {
 			expected: HealthStatus{Status: "ok", StatusCode: 200},
 		},
 		{
+			name: "with js meta only",
+			req: &HealthzEventOptions{
+				HealthzOptions: HealthzOptions{
+					JSMetaOnly: true,
+				},
+			},
+			expected: HealthStatus{Status: "ok", StatusCode: 200},
+		},
+		{
 			name: "with account name",
 			req: &HealthzEventOptions{
 				HealthzOptions: HealthzOptions{
@@ -3046,6 +3055,7 @@ func TestServerEventsPingMonitorz(t *testing.T) {
 		{"HEALTHZ", nil, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSEnabledOnly: true}, &JSzOptions{}, []string{"status"}},
 		{"HEALTHZ", &HealthzOptions{JSServerOnly: true}, &JSzOptions{}, []string{"status"}},
+		{"HEALTHZ", &HealthzOptions{JSMetaOnly: true}, &JSzOptions{}, []string{"status"}},
 		{"EXPVARZ", nil, &ExpvarzStatus{}, []string{"memstats", "cmdline"}},
 	}
 
@@ -3605,14 +3615,17 @@ func TestClusterSetupMsgs(t *testing.T) {
 	c := createClusterEx(t, false, 0, false, "cluster", numServers)
 	defer shutdownCluster(c)
 
-	var totalOut int
-	for _, server := range c.servers {
-		totalOut += int(atomic.LoadInt64(&server.outMsgs))
-	}
-	totalExpected := numServers * numServers
-	if totalOut >= totalExpected {
-		t.Fatalf("Total outMsgs is %d, expected < %d\n", totalOut, totalExpected)
-	}
+	checkFor(t, 3*time.Second, 500*time.Millisecond, func() error {
+		var totalOut int
+		for _, server := range c.servers {
+			totalOut += int(atomic.LoadInt64(&server.outMsgs))
+		}
+		totalExpected := numServers * numServers
+		if totalOut >= totalExpected {
+			return fmt.Errorf("Total outMsgs is %d, expected < %d\n", totalOut, totalExpected)
+		}
+		return nil
+	})
 }
 
 func TestServerEventsProfileZNotBlockingRecvQ(t *testing.T) {

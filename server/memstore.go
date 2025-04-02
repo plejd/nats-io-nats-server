@@ -228,11 +228,12 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 
 	// Check if we have and need the age expiration timer running.
 	switch {
+	case ms.ttls != nil && ttl > 0:
+		ms.resetAgeChk(0)
 	case ms.ageChk == nil && (ms.cfg.MaxAge > 0 || ms.ttls != nil):
 		ms.startAgeChk()
-	case ms.ageChk != nil && ms.ttls != nil && ttl > 0:
-		ms.resetAgeChk(0)
 	}
+
 	return nil
 }
 
@@ -992,20 +993,22 @@ func (ms *memStore) subjectDeleteMarkerIfNeeded(subj string, reason string) func
 		return nil
 	}
 	var _hdr [128]byte
-	hdr := fmt.Appendf(_hdr[:0], "NATS/1.0\r\n%s: %s\r\n%s: %s\r\n\r\n", JSMarkerReason, reason, JSMessageTTL, time.Duration(ttl)*time.Second)
-	seq, ts := ms.state.LastSeq+1, time.Now().UnixNano()
-	// Store it in the stream and then prepare the callbacks
-	// to return to the caller.
-	if err := ms.storeRawMsg(subj, hdr, nil, seq, ts, ttl); err != nil {
-		return nil
+	hdr := fmt.Appendf(
+		_hdr[:0],
+		"NATS/1.0\r\n%s: %s\r\n%s: %s\r\n%s: %d\r\n%s: %s\r\n\r\n\r\n",
+		JSMarkerReason, reason,
+		JSMessageTTL, time.Duration(ttl)*time.Second,
+		JSExpectedLastSubjSeq, 0,
+		JSExpectedLastSubjSeqSubj, subj,
+	)
+	msg := &inMsg{
+		subj: subj,
+		hdr:  hdr,
 	}
-	cb, tcb := ms.scb, ms.sdmcb
+	sdmcb := ms.sdmcb
 	return func() {
-		if cb != nil {
-			cb(1, int64(memStoreMsgSize(subj, hdr, nil)), seq, subj)
-		}
-		if tcb != nil {
-			tcb(seq, subj)
+		if sdmcb != nil {
+			sdmcb(msg)
 		}
 	}
 }
@@ -1147,10 +1150,7 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64, _ /* noMarker
 // Purge will remove all messages from this store.
 // Will return the number of purged messages.
 func (ms *memStore) Purge() (uint64, error) {
-	ms.mu.RLock()
-	first := ms.state.LastSeq + 1
-	ms.mu.RUnlock()
-	return ms.purge(first, false)
+	return ms.purge(0, false)
 }
 
 func (ms *memStore) purge(fseq uint64, _ /* noMarkers */ bool) (uint64, error) {
@@ -1162,7 +1162,9 @@ func (ms *memStore) purge(fseq uint64, _ /* noMarkers */ bool) (uint64, error) {
 	purged := uint64(len(ms.msgs))
 	cb := ms.scb
 	bytes := int64(ms.state.Bytes)
-	if fseq < ms.state.LastSeq {
+	if fseq == 0 {
+		fseq = ms.state.LastSeq + 1
+	} else if fseq < ms.state.LastSeq {
 		ms.mu.Unlock()
 		return 0, fmt.Errorf("partial purges not supported on memory store")
 	}
@@ -1631,9 +1633,24 @@ func (ms *memStore) removeSeqPerSubject(subj string, seq uint64, marker bool) bo
 	}
 	ss.Msgs--
 
+	// Only one left
+	if ss.Msgs == 1 {
+		if !ss.lastNeedsUpdate && seq != ss.Last {
+			ss.First = ss.Last
+			ss.firstNeedsUpdate = false
+			return false
+		}
+		if !ss.firstNeedsUpdate && seq != ss.First {
+			ss.Last = ss.First
+			ss.lastNeedsUpdate = false
+			return false
+		}
+	}
+
 	// We can lazily calculate the first/last sequence when needed.
 	ss.firstNeedsUpdate = seq == ss.First || ss.firstNeedsUpdate
 	ss.lastNeedsUpdate = seq == ss.Last || ss.lastNeedsUpdate
+
 	return false
 }
 

@@ -1997,19 +1997,22 @@ func (rg *raftGroup) setPreferred() {
 }
 
 // createRaftGroup is called to spin up this raft group if needed.
-func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, storage StorageType, labels pprofLabels) error {
+func (js *jetStream) createRaftGroup(accName string, rg *raftGroup, storage StorageType, labels pprofLabels) (RaftNode, error) {
+	// Must hold JS lock throughout, otherwise two parallel calls for the same raft group could result
+	// in duplicate instances for the same identifier, if the current Raft node is shutting down.
+	// We can release the lock temporarily while waiting for the Raft node to shut down.
 	js.mu.Lock()
+	defer js.mu.Unlock()
+
 	s, cc := js.srv, js.cluster
 	if cc == nil || cc.meta == nil {
-		js.mu.Unlock()
-		return NewJSClusterNotActiveError()
+		return nil, NewJSClusterNotActiveError()
 	}
 
 	// If this is a single peer raft group or we are not a member return.
 	if len(rg.Peers) <= 1 || !rg.isMember(cc.meta.ID()) {
-		js.mu.Unlock()
 		// Nothing to do here.
-		return nil
+		return nil, nil
 	}
 
 	// Check if we already have this assigned.
@@ -2037,20 +2040,35 @@ retry:
 			samePeers = slices.Equal(groupPeerIDs, nodePeerIDs)
 		}
 		if !samePeers {
+			// At this point we have no way of knowing:
+			// 1. Whether the group has lost enough nodes to cause a quorum
+			//    loss, in which case a proposal may fail, therefore we will
+			//    force a peerstate write;
+			// 2. Whether nodes in the group have other applies queued up
+			//    that could change the peerstate again, therefore the leader
+			//    should send out a new proposal anyway too just to make sure
+			//    that this change gets captured in the log.
 			node.UpdateKnownPeers(groupPeerIDs)
+
+			// If the peers changed as a result of an update by the meta layer, we must reflect that in the log of
+			// this group. Otherwise, a new peer would come up and instantly reset the peer state back to whatever is
+			// in the log at that time, overwriting what the meta layer told it.
+			// Will need to address this properly later on, by for example having the meta layer decide the new
+			// placement, but have the leader of this group propose it through its own log instead.
+			if node.Leader() {
+				node.ProposeKnownPeers(groupPeerIDs)
+			}
 		}
 		rg.node = node
-		js.mu.Unlock()
-		return nil
+		return node, nil
 	}
 
 	s.Debugf("JetStream cluster creating raft group:%+v", rg)
-	js.mu.Unlock()
 
 	sysAcc := s.SystemAccount()
 	if sysAcc == nil {
 		s.Debugf("JetStream cluster detected shutdown processing raft group: %+v", rg)
-		return errors.New("shutting down")
+		return nil, errors.New("shutting down")
 	}
 
 	// Check here to see if we have a max HA Assets limit set.
@@ -2059,7 +2077,7 @@ retry:
 			s.Warnf("Maximum HA Assets limit reached: %d", maxHaAssets)
 			// Since the meta leader assigned this, send a statsz update to them to get them up to date.
 			go s.sendStatszUpdate()
-			return errors.New("system limit reached")
+			return nil, errors.New("system limit reached")
 		}
 	}
 
@@ -2080,14 +2098,14 @@ retry:
 		)
 		if err != nil {
 			s.Errorf("Error creating filestore WAL: %v", err)
-			return err
+			return nil, err
 		}
 		store = fs
 	} else {
 		ms, err := newMemStore(&StreamConfig{Name: rg.Name, Storage: MemoryStorage})
 		if err != nil {
 			s.Errorf("Error creating memstore WAL: %v", err)
-			return err
+			return nil, err
 		}
 		store = ms
 	}
@@ -2101,17 +2119,15 @@ retry:
 	n, err := s.startRaftNode(accName, cfg, labels)
 	if err != nil || n == nil {
 		s.Debugf("Error creating raft group: %v", err)
-		return err
+		return nil, err
 	}
-	// Need locking here for the assignment to avoid data-race reports
-	js.mu.Lock()
+	// Need JS lock to be held for the assignment to avoid data-race reports
 	rg.node = n
 	// See if we are preferred and should start campaign immediately.
 	if n.ID() == rg.Preferred && n.Term() == 0 {
-		n.Campaign()
+		n.CampaignImmediately()
 	}
-	js.mu.Unlock()
-	return nil
+	return n, nil
 }
 
 func (mset *stream) raftGroup() *raftGroup {
@@ -3735,7 +3751,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 	js.mu.RUnlock()
 
 	// Process the raft group and make sure it's running if needed.
-	err := js.createRaftGroup(acc.GetName(), rg, storage, pprofLabels{
+	_, err := js.createRaftGroup(acc.GetName(), rg, storage, pprofLabels{
 		"type":    "stream",
 		"account": acc.Name,
 		"stream":  sa.Config.Name,
@@ -4335,28 +4351,18 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment, state 
 	// Check if we already have this consumer running.
 	o := mset.lookupConsumer(consumer)
 
-	if !alreadyRunning {
-		// Process the raft group and make sure its running if needed.
-		storage := mset.config().Storage
-		if ca.Config.MemoryStorage {
-			storage = MemoryStorage
-		}
-		// No-op if R1.
-		js.createRaftGroup(accName, rg, storage, pprofLabels{
-			"type":     "consumer",
-			"account":  mset.accName(),
-			"stream":   ca.Stream,
-			"consumer": ca.Name,
-		})
-	} else {
-		// If we are clustered update the known peers.
-		js.mu.RLock()
-		node := rg.node
-		js.mu.RUnlock()
-		if node != nil {
-			node.UpdateKnownPeers(ca.Group.Peers)
-		}
+	// Process the raft group and make sure it's running if needed.
+	storage := mset.config().Storage
+	if ca.Config.MemoryStorage {
+		storage = MemoryStorage
 	}
+	// No-op if R1.
+	js.createRaftGroup(accName, rg, storage, pprofLabels{
+		"type":     "consumer",
+		"account":  mset.accName(),
+		"stream":   ca.Stream,
+		"consumer": ca.Name,
+	})
 
 	// Check if we already have this consumer running.
 	var didCreate, isConfigUpdate, needsLocalResponse bool
@@ -5582,6 +5588,13 @@ func (js *jetStream) processLeaderChange(isLeader bool) {
 
 	js.mu.Lock()
 	defer js.mu.Unlock()
+
+	if isLeader {
+		if meta := js.cluster.meta; meta != nil && meta.IsObserver() {
+			meta.StepDown()
+			return
+		}
+	}
 
 	if isLeader {
 		js.startUpdatesSub()
@@ -7956,6 +7969,26 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 			}
 			return errStreamMismatch
 		}
+		// TTL'd messages are rejected entirely if TTLs are not enabled on the stream, or if the TTL is invalid.
+		if ttl, err := getMessageTTL(hdr); !sourced && (ttl != 0 || err != nil) {
+			if !allowTTL {
+				if canRespond {
+					var resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
+					resp.Error = NewJSMessageTTLDisabledError()
+					b, _ := json.Marshal(resp)
+					outq.sendMsg(reply, b)
+				}
+				return errMsgTTLDisabled
+			} else if err != nil {
+				if canRespond {
+					var resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
+					resp.Error = NewJSMessageTTLInvalidError()
+					b, _ := json.Marshal(resp)
+					outq.sendMsg(reply, b)
+				}
+				return err
+			}
+		}
 		// Check for MsgIds here at the cluster level to avoid excessive CLFS accounting.
 		// Will help during restarts.
 		if msgId = getMsgId(hdr); msgId != _EMPTY_ {
@@ -7984,17 +8017,6 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 			// For now we stage with zero, and will update in processStreamMsg.
 			mset.storeMsgIdLocked(&ddentry{msgId, 0, time.Now().UnixNano()})
 			mset.mu.Unlock()
-		}
-
-		// TTL'd messages are rejected entirely if TTLs are not enabled on the stream.
-		if ttl, _ := getMessageTTL(hdr); !sourced && ttl != 0 && !allowTTL {
-			if canRespond {
-				var resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
-				resp.Error = NewJSMessageTTLDisabledError()
-				b, _ := json.Marshal(resp)
-				outq.sendMsg(reply, b)
-			}
-			return errMsgTTLDisabled
 		}
 	}
 

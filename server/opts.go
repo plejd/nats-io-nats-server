@@ -281,15 +281,17 @@ type AuthCallout struct {
 // NOTE: This structure is no longer used for monitoring endpoints
 // and json tags are deprecated and may be removed in the future.
 type Options struct {
-	ConfigFile                 string        `json:"-"`
-	ServerName                 string        `json:"server_name"`
-	Host                       string        `json:"addr"`
-	Port                       int           `json:"port"`
-	DontListen                 bool          `json:"dont_listen"`
-	ClientAdvertise            string        `json:"-"`
-	Trace                      bool          `json:"-"`
-	Debug                      bool          `json:"-"`
-	TraceVerbose               bool          `json:"-"`
+	ConfigFile      string `json:"-"`
+	ServerName      string `json:"server_name"`
+	Host            string `json:"addr"`
+	Port            int    `json:"port"`
+	DontListen      bool   `json:"dont_listen"`
+	ClientAdvertise string `json:"-"`
+	Trace           bool   `json:"-"`
+	Debug           bool   `json:"-"`
+	TraceVerbose    bool   `json:"-"`
+	// TraceHeaders if true will only trace message headers, not the payload
+	TraceHeaders               bool          `json:"-"`
 	NoLog                      bool          `json:"-"`
 	NoSigs                     bool          `json:"-"`
 	NoSublistCache             bool          `json:"-"`
@@ -1002,6 +1004,11 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 		o.Trace = v.(bool)
 		trackExplicitVal(&o.inConfig, "TraceVerbose", o.TraceVerbose)
 		trackExplicitVal(&o.inConfig, "Trace", o.Trace)
+	case "trace_headers":
+		o.TraceHeaders = v.(bool)
+		o.Trace = v.(bool)
+		trackExplicitVal(&o.inConfig, "TraceHeaders", o.TraceHeaders)
+		trackExplicitVal(&o.inConfig, "Trace", o.Trace)
 	case "logtime":
 		o.Logtime = v.(bool)
 		trackExplicitVal(&o.inConfig, "Logtime", o.Logtime)
@@ -1025,7 +1032,7 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 			return
 		}
 	case "authorization":
-		auth, err := parseAuthorization(tk, errors)
+		auth, err := parseAuthorization(tk, errors, warnings)
 		if err != nil {
 			*errors = append(*errors, err)
 			return
@@ -1802,7 +1809,7 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 		case "host", "net":
 			opts.Cluster.Host = mv.(string)
 		case "authorization":
-			auth, err := parseAuthorization(tk, errors)
+			auth, err := parseAuthorization(tk, errors, warnings)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
@@ -2038,7 +2045,7 @@ func parseGateway(v any, o *Options, errors *[]error, warnings *[]error) error {
 		case "host", "net":
 			o.Gateway.Host = mv.(string)
 		case "authorization":
-			auth, err := parseAuthorization(tk, errors)
+			auth, err := parseAuthorization(tk, errors, warnings)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
@@ -2186,9 +2193,9 @@ func parseJetStreamForAccount(v any, acc *Account, errors *[]error) error {
 				}
 				switch vv {
 				case "system", _EMPTY_:
-					acc.js.nrgAccount = _EMPTY_
+					acc.nrgAccount = _EMPTY_
 				case "owner":
-					acc.js.nrgAccount = acc.Name
+					acc.nrgAccount = acc.Name
 				default:
 					return &configErr{tk, fmt.Sprintf("Expected 'system' or 'owner' string value for %q, got %v", mk, mv)}
 				}
@@ -2500,7 +2507,7 @@ func parseLeafNodes(v any, opts *Options, errors *[]error, warnings *[]error) er
 		case "host", "net":
 			opts.LeafNode.Host = mv.(string)
 		case "authorization":
-			auth, err := parseLeafAuthorization(tk, errors)
+			auth, err := parseLeafAuthorization(tk, errors, warnings)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
@@ -2579,7 +2586,7 @@ func parseLeafNodes(v any, opts *Options, errors *[]error, warnings *[]error) er
 
 // This is the authorization parser adapter for the leafnode's
 // authorization config.
-func parseLeafAuthorization(v any, errors *[]error) (*authorization, error) {
+func parseLeafAuthorization(v any, errors, warnings *[]error) (*authorization, error) {
 	var (
 		am   map[string]any
 		tk   token
@@ -2604,12 +2611,24 @@ func parseLeafAuthorization(v any, errors *[]error) (*authorization, error) {
 			}
 			auth.nkey = nk
 		case "timeout":
-			at := float64(1)
+			at := float64(0)
 			switch mv := mv.(type) {
 			case int64:
 				at = float64(mv)
 			case float64:
 				at = mv
+			case string:
+				d, err := time.ParseDuration(mv)
+				if err != nil {
+					return nil, &configErr{tk, fmt.Sprintf("error parsing leafnode authorization config, 'timeout' %s", err)}
+				}
+				at = d.Seconds()
+			default:
+				return nil, &configErr{tk, "error parsing leafnode authorization config, 'timeout' wrong type"}
+			}
+			if at > (60 * time.Second).Seconds() {
+				reason := fmt.Sprintf("timeout of %v (%f seconds) is high, consider keeping it under 60 seconds. possibly caused by unquoted duration; use '1m' instead of 1m, for example", mv, at)
+				*warnings = append(*warnings, &configWarningErr{field: mk, configErr: configErr{token: tk, reason: reason}})
 			}
 			auth.timeout = at
 		case "users":
@@ -3586,8 +3605,9 @@ func parseAccountImports(v any, acc *Account, errors *[]error) ([]*importStream,
 
 	var services []*importService
 	var streams []*importStream
-	svcSubjects := map[string]*importService{}
+	svcSubjects := map[string][]*importService{}
 
+IMS_LOOP:
 	for _, v := range ims {
 		// Should have stream or service
 		stream, service, err := parseImportStreamOrService(v, errors)
@@ -3596,16 +3616,20 @@ func parseAccountImports(v any, acc *Account, errors *[]error) ([]*importStream,
 			continue
 		}
 		if service != nil {
-			if dup := svcSubjects[service.to]; dup != nil {
-				tk, _ := unwrapValue(v, &lt)
-				err := &configErr{tk,
-					fmt.Sprintf("Duplicate service import subject %q, previously used in import for account %q, subject %q",
-						service.to, dup.an, dup.sub)}
-				*errors = append(*errors, err)
-				continue
+			sisPerSubj := svcSubjects[service.to]
+			for _, dup := range sisPerSubj {
+				if dup.an == service.an {
+					tk, _ := unwrapValue(v, &lt)
+					err := &configErr{tk,
+						fmt.Sprintf("Duplicate service import subject %q, previously used in import for account %q, subject %q",
+							service.to, dup.an, dup.sub)}
+					*errors = append(*errors, err)
+					continue IMS_LOOP
+				}
 			}
-			svcSubjects[service.to] = service
 			service.acc = acc
+			sisPerSubj = append(sisPerSubj, service)
+			svcSubjects[service.to] = sisPerSubj
 			services = append(services, service)
 		}
 		if stream != nil {
@@ -4098,7 +4122,7 @@ func applyDefaultPermissions(users []*User, nkeys []*NkeyUser, defaultP *Permiss
 }
 
 // Helper function to parse Authorization configs.
-func parseAuthorization(v any, errors *[]error) (*authorization, error) {
+func parseAuthorization(v any, errors, warnings *[]error) (*authorization, error) {
 	var (
 		am   map[string]any
 		tk   token
@@ -4119,12 +4143,24 @@ func parseAuthorization(v any, errors *[]error) (*authorization, error) {
 		case "token":
 			auth.token = mv.(string)
 		case "timeout":
-			at := float64(1)
+			at := float64(0)
 			switch mv := mv.(type) {
 			case int64:
 				at = float64(mv)
 			case float64:
 				at = mv
+			case string:
+				d, err := time.ParseDuration(mv)
+				if err != nil {
+					return nil, &configErr{tk, fmt.Sprintf("error parsing authorization config, 'timeout' %s", err)}
+				}
+				at = d.Seconds()
+			default:
+				return nil, &configErr{tk, "error parsing authorization config, 'timeout' wrong type"}
+			}
+			if at > (60 * time.Second).Seconds() {
+				reason := fmt.Sprintf("timeout of %v (%f seconds) is high, consider keeping it under 60 seconds. possibly caused by unquoted duration; use '1m' instead of 1m, for example", mv, at)
+				*warnings = append(*warnings, &configWarningErr{field: mk, configErr: configErr{token: tk, reason: reason}})
 			}
 			auth.timeout = at
 		case "users":
@@ -5400,86 +5436,6 @@ func mergeRoutes(opts, flagOpts *Options) {
 	}
 	opts.Routes = routeUrls
 	opts.RoutesStr = flagOpts.RoutesStr
-}
-
-// RemoveSelfReference removes this server from an array of routes
-func RemoveSelfReference(clusterPort int, routes []*url.URL) ([]*url.URL, error) {
-	var cleanRoutes []*url.URL
-	cport := strconv.Itoa(clusterPort)
-
-	selfIPs, err := getInterfaceIPs()
-	if err != nil {
-		return nil, err
-	}
-	for _, r := range routes {
-		host, port, err := net.SplitHostPort(r.Host)
-		if err != nil {
-			return nil, err
-		}
-
-		ipList, err := getURLIP(host)
-		if err != nil {
-			return nil, err
-		}
-		if cport == port && isIPInList(selfIPs, ipList) {
-			continue
-		}
-		cleanRoutes = append(cleanRoutes, r)
-	}
-
-	return cleanRoutes, nil
-}
-
-func isIPInList(list1 []net.IP, list2 []net.IP) bool {
-	for _, ip1 := range list1 {
-		for _, ip2 := range list2 {
-			if ip1.Equal(ip2) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func getURLIP(ipStr string) ([]net.IP, error) {
-	ipList := []net.IP{}
-
-	ip := net.ParseIP(ipStr)
-	if ip != nil {
-		ipList = append(ipList, ip)
-		return ipList, nil
-	}
-
-	hostAddr, err := net.LookupHost(ipStr)
-	if err != nil {
-		return nil, fmt.Errorf("Error looking up host with route hostname: %v", err)
-	}
-	for _, addr := range hostAddr {
-		ip = net.ParseIP(addr)
-		if ip != nil {
-			ipList = append(ipList, ip)
-		}
-	}
-	return ipList, nil
-}
-
-func getInterfaceIPs() ([]net.IP, error) {
-	var localIPs []net.IP
-
-	interfaceAddr, err := net.InterfaceAddrs()
-	if err != nil {
-		return nil, fmt.Errorf("Error getting self referencing address: %v", err)
-	}
-
-	for i := 0; i < len(interfaceAddr); i++ {
-		interfaceIP, _, _ := net.ParseCIDR(interfaceAddr[i].String())
-		if net.ParseIP(interfaceIP.String()) != nil {
-			localIPs = append(localIPs, interfaceIP)
-		} else {
-			return nil, fmt.Errorf("Error parsing self referencing address: %v", err)
-		}
-	}
-	return localIPs, nil
 }
 
 func setBaselineOptions(opts *Options) {

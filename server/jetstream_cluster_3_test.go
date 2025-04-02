@@ -243,8 +243,29 @@ func TestJetStreamClusterMetaRecoveryLogic(t *testing.T) {
 	})
 	require_NoError(t, err)
 
+	// Stream delete is answered by stream leader, stream add is answered by meta leader.
+	// If meta leader is slower to delete, a quick add-after-delete would error with stream already exists.
+	waitForDeleteStream := func() {
+		t.Helper()
+		checkFor(t, time.Second, 100*time.Millisecond, func() error {
+			ml := c.leader()
+			if ml == nil {
+				return errors.New("no meta leader")
+			}
+			sjs := ml.getJetStream()
+			sjs.mu.RLock()
+			sa := sjs.streamAssignment("$G", "TEST")
+			sjs.mu.RUnlock()
+			if sa != nil {
+				return errors.New("stream exists still")
+			}
+			return nil
+		})
+	}
+
 	err = js.DeleteStream("TEST")
 	require_NoError(t, err)
+	waitForDeleteStream()
 
 	_, err = js.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
@@ -255,6 +276,7 @@ func TestJetStreamClusterMetaRecoveryLogic(t *testing.T) {
 
 	err = js.DeleteStream("TEST")
 	require_NoError(t, err)
+	waitForDeleteStream()
 
 	_, err = js.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
@@ -268,10 +290,30 @@ func TestJetStreamClusterMetaRecoveryLogic(t *testing.T) {
 
 	c.stopAll()
 	c.restartAll()
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+		s := c.leader()
+		hs := s.healthz(&HealthzOptions{
+			JSMetaOnly: true,
+		})
+		if hs.Error != _EMPTY_ {
+			return errors.New(hs.Error)
+		}
+		return nil
+	})
 	c.waitOnLeader()
 	c.waitOnStreamLeader("$G", "TEST")
 
 	s = c.randomNonLeader()
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
+		hs := s.healthz(&HealthzOptions{
+			JSMetaOnly: true,
+		})
+		if hs.Error != _EMPTY_ {
+			return errors.New(hs.Error)
+		}
+		return nil
+	})
+
 	nc, js = jsClientConnect(t, s)
 	defer nc.Close()
 
@@ -1223,6 +1265,13 @@ func TestJetStreamClusterHAssetsEnforcement(t *testing.T) {
 }
 
 func TestJetStreamClusterInterestStreamConsumer(t *testing.T) {
+	checkInterestStateT = 4 * time.Second
+	checkInterestStateJ = 1
+	defer func() {
+		checkInterestStateT = defaultCheckInterestStateT
+		checkInterestStateJ = defaultCheckInterestStateJ
+	}()
+
 	c := createJetStreamClusterExplicit(t, "R5S", 5)
 	defer c.shutdown()
 
@@ -1270,7 +1319,7 @@ func TestJetStreamClusterInterestStreamConsumer(t *testing.T) {
 	}
 
 	// Make sure replicated acks are processed.
-	checkFor(t, time.Second, 250*time.Millisecond, func() error {
+	checkFor(t, 20*time.Second, 250*time.Millisecond, func() error {
 		si, err := js.StreamInfo("TEST")
 		if err != nil {
 			return err
@@ -2225,7 +2274,7 @@ func TestJetStreamClusterAfterPeerRemoveZeroState(t *testing.T) {
 
 	// validate the origPeer is removed with a replacement newPeer
 	sc.waitOnStreamLeader(globalAccountName, "foo")
-	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
 		osi, err = jsc.StreamInfo("foo")
 		require_NoError(t, err)
 		if len(osi.Cluster.Replicas) != 2 {
@@ -2263,7 +2312,7 @@ func TestJetStreamClusterAfterPeerRemoveZeroState(t *testing.T) {
 
 	// validate the newPeer is removed and R3 has reformed (with origPeer)
 	sc.waitOnStreamLeader(globalAccountName, "foo")
-	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
 		osi, err = jsc.StreamInfo("foo")
 		require_NoError(t, err)
 		if len(osi.Cluster.Replicas) != 2 {
@@ -2292,7 +2341,7 @@ func TestJetStreamClusterAfterPeerRemoveZeroState(t *testing.T) {
 		t.Fatalf("expected to get a handle to original peer server by name")
 	}
 
-	checkFor(t, time.Second, 200*time.Millisecond, func() error {
+	checkFor(t, 10*time.Second, 200*time.Millisecond, func() error {
 		jszResult, err := origServer.Jsz(nil)
 		require_NoError(t, err)
 		if jszResult.Store != assetStoreBytesExpected {
@@ -4891,6 +4940,9 @@ func TestJetStreamClusterAccountUsageDrifts(t *testing.T) {
 
 	nc, js := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
 	defer nc.Close()
+
+	// Prevent 'nats: JetStream not enabled for account' when creating the first stream.
+	c.waitOnAccount(aExpPub)
 
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:     "TEST1",

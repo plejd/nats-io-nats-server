@@ -1897,12 +1897,29 @@ func (c *client) flushSignal() {
 // Traces a message.
 // Will NOT check if tracing is enabled, does NOT need the client lock.
 func (c *client) traceMsg(msg []byte) {
-	maxTrace := c.srv.getOpts().MaxTracedMsgLen
-	if maxTrace > 0 && (len(msg)-LEN_CR_LF) > maxTrace {
+	opts := c.srv.getOpts()
+	maxTrace := opts.MaxTracedMsgLen
+	headersOnly := opts.TraceHeaders
+	suffix := LEN_CR_LF
+
+	// If TraceHeaders is enabled, extract only the header portion of the msg.
+	// If a header is present, it ends with an additional trailing CRLF.
+	if headersOnly {
+		msg, _ = c.msgParts(msg)
+		suffix += LEN_CR_LF
+	}
+
+	// Do not emit a log line for zero-length payloads.
+	l := len(msg) - suffix
+	if l <= 0 {
+		return
+	}
+
+	if maxTrace > 0 && l > maxTrace {
 		tm := fmt.Sprintf("%q", msg[:maxTrace])
-		c.Tracef("<<- MSG_PAYLOAD: [\"%s...\"]", tm[1:maxTrace+1])
+		c.Tracef("<<- MSG_PAYLOAD: [\"%s...\"]", tm[1:len(tm)-1])
 	} else {
-		c.Tracef("<<- MSG_PAYLOAD: [%q]", msg[:len(msg)-LEN_CR_LF])
+		c.Tracef("<<- MSG_PAYLOAD: [%q]", msg[:l])
 	}
 }
 
@@ -3820,24 +3837,34 @@ func (c *client) pruneDenyCache() {
 // prunePubPermsCache will prune the cache via randomly
 // deleting items. Doing so pruneSize items at a time.
 func (c *client) prunePubPermsCache() {
-	// There is a case where we can invoke this from multiple go routines,
-	// (in deliverMsg() if sub.client is a LEAF), so we make sure to prune
-	// from only one go routine at a time.
-	if !atomic.CompareAndSwapInt32(&c.perms.prun, 0, 1) {
-		return
-	}
-	const maxPruneAtOnce = 1000
-	r := 0
-	c.perms.pcache.Range(func(k, _ any) bool {
-		c.perms.pcache.Delete(k)
-		if r++; (r > pruneSize && atomic.LoadInt32(&c.perms.pcsz) < int32(maxPermCacheSize)) ||
-			(r > maxPruneAtOnce) {
-			return false
+	// With parallel additions to the cache, it is possible that this function
+	// would not be able to reduce the cache to its max size in one go. We
+	// will try a few times but will release/reacquire the "lock" at each
+	// attempt to give a chance to another go routine to take over and not
+	// have this go routine do too many attempts.
+	for i := 0; i < 5; i++ {
+		// There is a case where we can invoke this from multiple go routines,
+		// (in deliverMsg() if sub.client is a LEAF), so we make sure to prune
+		// from only one go routine at a time.
+		if !atomic.CompareAndSwapInt32(&c.perms.prun, 0, 1) {
+			return
 		}
-		return true
-	})
-	atomic.AddInt32(&c.perms.pcsz, -int32(r))
-	atomic.StoreInt32(&c.perms.prun, 0)
+		const maxPruneAtOnce = 1000
+		r := 0
+		c.perms.pcache.Range(func(k, _ any) bool {
+			c.perms.pcache.Delete(k)
+			if r++; (r > pruneSize && atomic.LoadInt32(&c.perms.pcsz) < int32(maxPermCacheSize)) ||
+				(r > maxPruneAtOnce) {
+				return false
+			}
+			return true
+		})
+		n := atomic.AddInt32(&c.perms.pcsz, -int32(r))
+		atomic.StoreInt32(&c.perms.prun, 0)
+		if n <= int32(maxPermCacheSize) {
+			return
+		}
+	}
 }
 
 // pubAllowed checks on publish permissioning.

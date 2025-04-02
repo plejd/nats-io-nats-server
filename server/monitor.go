@@ -2727,8 +2727,10 @@ func (s *Server) accountInfo(accName string) (*AccountInfo, error) {
 		}
 		imports = append(imports, imp)
 	}
-	for _, v := range a.imports.services {
-		imports = append(imports, newExtImport(v))
+	for _, sis := range a.imports.services {
+		for _, v := range sis {
+			imports = append(imports, newExtImport(v))
+		}
 	}
 	responses := map[string]ExtImport{}
 	for k, v := range a.exports.responses {
@@ -2802,6 +2804,7 @@ type HealthzOptions struct {
 	JSEnabled     bool   `json:"js-enabled,omitempty"`
 	JSEnabledOnly bool   `json:"js-enabled-only,omitempty"`
 	JSServerOnly  bool   `json:"js-server-only,omitempty"`
+	JSMetaOnly    bool   `json:"js-meta-only,omitempty"`
 	Account       string `json:"account,omitempty"`
 	Stream        string `json:"stream,omitempty"`
 	Consumer      string `json:"consumer,omitempty"`
@@ -3282,6 +3285,10 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	jsMetaOnly, err := decodeBool(w, r, "js-meta-only")
+	if err != nil {
+		return
+	}
 
 	includeDetails, err := decodeBool(w, r, "details")
 	if err != nil {
@@ -3292,6 +3299,7 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 		JSEnabled:     jsEnabled,
 		JSEnabledOnly: jsEnabledOnly,
 		JSServerOnly:  jsServerOnly,
+		JSMetaOnly:    jsMetaOnly,
 		Account:       r.URL.Query().Get("account"),
 		Stream:        r.URL.Query().Get("stream"),
 		Consumer:      r.URL.Query().Get("consumer"),
@@ -3568,6 +3576,7 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 		}
 		return health
 	}
+
 	// If we are not current with the meta leader.
 	if !meta.Healthy() {
 		if !details {
@@ -3598,6 +3607,11 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 				},
 			}
 		}
+		return health
+	}
+
+	// Skips doing full healthz and only checks the meta leader.
+	if opts.JSMetaOnly {
 		return health
 	}
 
