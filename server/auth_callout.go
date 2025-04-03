@@ -304,6 +304,8 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options) (authorize
 		// Check if we need to set an auth timer if the user jwt expires.
 		c.setExpiration(arc.Claims(), expiration)
 
+		c.Debugf("Auth callout succeeded, created user %q, on account %q (%q) with tags %v", arc.Subject, arc.IssuerAccount, arc.Audience, arc.Tags)
+
 		respCh <- _EMPTY_
 	}
 
