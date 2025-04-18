@@ -4312,7 +4312,7 @@ func TestJWTLimits(t *testing.T) {
 	})
 }
 
-func TestJwtTemplates(t *testing.T) {
+func TestJWTTemplates(t *testing.T) {
 	kp, _ := nkeys.CreateAccount()
 	aPub, _ := kp.PublicKey()
 	ukp, _ := nkeys.CreateUser()
@@ -4363,7 +4363,7 @@ func TestJwtTemplates(t *testing.T) {
 	require_Contains(t, err.Error(), "generated invalid subject")
 }
 
-func TestJwtInLineTemplates(t *testing.T) {
+func TestJWTInLineTemplates(t *testing.T) {
 	kp, _ := nkeys.CreateAccount()
 	aPub, _ := kp.PublicKey()
 	ukp, _ := nkeys.CreateUser()
@@ -4393,7 +4393,7 @@ func TestJwtInLineTemplates(t *testing.T) {
 	test(resLim.Pub.Allow, []string{"$JS.API.STREAM.INFO.KV_a"})
 }
 
-func TestJwtTemplateGoodTagAfterBadTag(t *testing.T) {
+func TestJWTTemplateGoodTagAfterBadTag(t *testing.T) {
 	kp, _ := nkeys.CreateAccount()
 	aPub, _ := kp.PublicKey()
 	ukp, _ := nkeys.CreateUser()
@@ -5792,7 +5792,7 @@ func TestJWTQueuePermissions(t *testing.T) {
 	}
 }
 
-func TestJWScopedSigningKeys(t *testing.T) {
+func TestJWTScopedSigningKeys(t *testing.T) {
 	sysKp, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
 	sysCreds := newUser(t, sysKp)
@@ -6515,7 +6515,7 @@ func TestJWTAccountConnzAccessAfterClaimUpdate(t *testing.T) {
 	doRequest()
 }
 
-func TestAccountWeightedMappingInSuperCluster(t *testing.T) {
+func TestJWTAccountWeightedMappingInSuperCluster(t *testing.T) {
 	skp, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "SYS"
@@ -6645,7 +6645,7 @@ func TestAccountWeightedMappingInSuperCluster(t *testing.T) {
 	}
 }
 
-func TestServerOperatorModeNoAuthRequired(t *testing.T) {
+func TestJWTServerOperatorModeNoAuthRequired(t *testing.T) {
 	_, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "$SYS"
@@ -6694,7 +6694,7 @@ func TestServerOperatorModeNoAuthRequired(t *testing.T) {
 	require_True(t, nc.AuthRequired())
 }
 
-func TestServerOperatorModeUserInfoExpiration(t *testing.T) {
+func TestJWTServerOperatorModeUserInfoExpiration(t *testing.T) {
 	_, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "$SYS"
@@ -7118,6 +7118,72 @@ func TestJWTImportsOnServerRestartAndClientsReconnect(t *testing.T) {
 	}
 }
 
+func TestDefaultSentinelUser(t *testing.T) {
+	var err error
+	preload := make(map[string]string)
+
+	_, sysPub, sysAC := NewJwtAccountClaim("SYS")
+	preload[sysPub], err = sysAC.Encode(oKp)
+	require_NoError(t, err)
+
+	aKP, aPub, aAC := NewJwtAccountClaim("A")
+	preload[aPub], err = aAC.Encode(oKp)
+	require_NoError(t, err)
+
+	preloadConfig, err := json.MarshalIndent(preload, "", " ")
+	require_NoError(t, err)
+
+	// test that the user will be rejected
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+`, ojwt, sysPub, preloadConfig)))
+
+	ns, _ := RunServerWithConfig(conf)
+	defer ns.Shutdown()
+	_, err = nats.Connect(ns.ClientURL(), nats.MaxReconnects(0))
+	require_Error(t, err)
+	require_True(t, errors.Is(err, nats.ErrAuthorization))
+	ns.Shutdown()
+
+	// test that user can connect
+	uKP, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	uPub, err := uKP.PublicKey()
+	require_NoError(t, err)
+	uc := jwt.NewUserClaims(uPub)
+	uc.BearerToken = true
+	uc.Name = "sentinel"
+	sentinelToken, err := uc.Encode(aKP)
+	require_NoError(t, err)
+	conf = createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken)))
+
+	ns, _ = RunServerWithConfig(conf)
+	defer ns.Shutdown()
+	nc, err := nats.Connect(ns.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
+	r, err := nc.Request("$SYS.REQ.USER.INFO", nil, time.Second*5)
+	require_NoError(t, err)
+	type SR struct {
+		Data UserInfo `json:"data"`
+	}
+	var ui SR
+	require_NoError(t, json.Unmarshal(r.Data, &ui))
+	require_Equal(t, ui.Data.UserID, uPub)
+}
+
 func TestJWTUpdateAccountClaimsStreamAndServiceImportDeadlock(t *testing.T) {
 	for _, exportType := range []jwt.ExportType{jwt.Stream, jwt.Service} {
 		t.Run(exportType.String(), func(t *testing.T) {
@@ -7220,4 +7286,64 @@ func TestJWTUpdateAccountClaimsStreamAndServiceImportDeadlock(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJWTJetStreamClientsExcludedForMaxConnsUpdate(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+
+	accKp, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
+		DiskStorage: 1100, MemoryStorage: 0, Consumer: 2, Streams: 2}
+	accClaim.Limits.Conn = 5
+	accJwt1 := encodeClaim(t, accClaim, accPub)
+	accCreds := newUser(t, accKp)
+
+	storeDir := t.TempDir()
+
+	dirSrv := t.TempDir()
+	cf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		server_name: s1
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		leaf {
+			listen: 127.0.0.1:-1
+		}
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+	`, storeDir, ojwt, syspub, dirSrv)))
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	updateJwt(t, s.ClientURL(), sysCreds, sysJwt, 1)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt1, 1)
+
+	nc, js := jsClientConnectURL(t, s.ClientURL(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 1, Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+
+	accClaim.Limits.Conn = 1
+	accJwt1 = encodeClaim(t, accClaim, accPub)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt1, 1)
+
+	// Manually reconnect.
+	nc.Close()
+	nc, js = jsClientConnectURL(t, s.ClientURL(), nats.UserCredentials(accCreds))
+	defer nc.Close()
+
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
 }

@@ -1387,14 +1387,23 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 	}
 
 	if cfg.SubjectDeleteMarkerTTL > 0 {
-		if !cfg.AllowMsgTTL {
-			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject marker delete cannot be set if message TTLs are disabled"))
-		}
 		if cfg.SubjectDeleteMarkerTTL < time.Second {
-			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject marker delete TTL must be at least 1 second"))
+			return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker TTL must be at least 1 second"))
+		}
+		if !cfg.AllowMsgTTL {
+			if pedantic {
+				return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker cannot be set if message TTLs are disabled"))
+			}
+			cfg.AllowMsgTTL = true
+		}
+		if !cfg.AllowRollup {
+			if pedantic {
+				return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker cannot be set if roll-ups are disabled"))
+			}
+			cfg.AllowRollup, cfg.DenyPurge = true, false
 		}
 	} else if cfg.SubjectDeleteMarkerTTL < 0 {
-		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject marker delete TTL must not be negative"))
+		return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subject delete marker TTL must not be negative"))
 	}
 
 	getStream := func(streamName string) (bool, StreamConfig) {
@@ -1668,16 +1677,19 @@ func (s *Server) checkStreamCfg(config *StreamConfig, acc *Account, pedantic boo
 				}
 			}
 			// Also check to make sure we do not overlap with our $JS API subjects.
-			if !cfg.NoAck && (subjectIsSubsetMatch(subj, "$JS.>") || subjectIsSubsetMatch(subj, "$JSC.>")) {
-				// We allow an exception for $JS.EVENT.> since these could have been created in the past.
-				if !subjectIsSubsetMatch(subj, "$JS.EVENT.>") {
-					return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subjects that overlap with jetstream api require no-ack to be true"))
+			if !cfg.NoAck {
+				for _, namespace := range []string{"$JS.>", "$JSC.>", "$NRG.>"} {
+					if SubjectsCollide(subj, namespace) {
+						// We allow an exception for $JS.EVENT.> since these could have been created in the past.
+						if !subjectIsSubsetMatch(subj, "$JS.EVENT.>") {
+							return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subjects that overlap with jetstream api require no-ack to be true"))
+						}
+					}
 				}
-			}
-			// And the $SYS subjects.
-			if !cfg.NoAck && subjectIsSubsetMatch(subj, "$SYS.>") {
-				if !subjectIsSubsetMatch(subj, "$SYS.ACCOUNT.>") {
-					return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subjects that overlap with system api require no-ack to be true"))
+				if SubjectsCollide(subj, "$SYS.>") {
+					if !subjectIsSubsetMatch(subj, "$SYS.ACCOUNT.>") {
+						return StreamConfig{}, NewJSStreamInvalidConfigError(fmt.Errorf("subjects that overlap with system api require no-ack to be true"))
+					}
 				}
 			}
 			// Mark for duplicate check.
@@ -1832,12 +1844,12 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server, pedan
 	}
 
 	// Check on the allowed message TTL status.
-	if cfg.AllowMsgTTL != old.AllowMsgTTL {
-		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("message TTL status can not be changed after stream creation"))
+	if old.AllowMsgTTL && !cfg.AllowMsgTTL {
+		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("message TTL status can not be disabled"))
 	}
 
 	// Do some adjustments for being sealed.
-	// Pedantic mode will allow those changes to be made, as they are determinictic and important to get a sealed stream.
+	// Pedantic mode will allow those changes to be made, as they are deterministic and important to get a sealed stream.
 	if cfg.Sealed {
 		cfg.MaxAge = 0
 		cfg.Discard = DiscardNew
@@ -2225,7 +2237,7 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 	mset.mu.RUnlock()
 
 	if preq != nil {
-		purged, err = mset.store.PurgeEx(preq.Subject, preq.Sequence, preq.Keep, false /*preq.NoMarkers*/)
+		purged, err = mset.store.PurgeEx(preq.Subject, preq.Sequence, preq.Keep)
 	} else {
 		purged, err = mset.store.Purge()
 	}
@@ -2267,7 +2279,7 @@ func (mset *stream) purge(preq *JSApiStreamPurgeRequest) (purged uint64, err err
 			// or consumer filter subject is subset of purged subject,
 			// but not the other way around.
 			o.isEqualOrSubsetMatch(preq.Subject)
-		// Check if a consumer has a wider subject space then what we purged
+		// Check if a consumer has a wider subject space than what we purged
 		var isWider bool
 		if !doPurge && preq != nil && o.isFilteredMatch(preq.Subject) {
 			doPurge, isWider = true, true
@@ -2836,7 +2848,14 @@ func (mset *stream) setupMirrorConsumer() error {
 		}
 		mirror.sfs = sfs
 		mirror.trs = trs
-		req.Config.FilterSubjects = sfs
+		// If there was no explicit FilterSubject defined and we have a single
+		// subject transform, use Config.FilterSubject instead of FilterSubjects
+		// so that we can use the extended consumer create API down below.
+		if req.Config.FilterSubject == _EMPTY_ && len(sfs) == 1 {
+			req.Config.FilterSubject = sfs[0]
+		} else {
+			req.Config.FilterSubjects = sfs
+		}
 	}
 
 	respCh := make(chan *JSApiConsumerCreateResponse, 1)
@@ -2862,8 +2881,6 @@ func (mset *stream) setupMirrorConsumer() error {
 		return nil
 	}
 
-	b, _ := json.Marshal(req)
-
 	var subject string
 	if req.Config.FilterSubject != _EMPTY_ {
 		req.Config.Name = fmt.Sprintf("mirror-%s", createConsumerName())
@@ -2875,6 +2892,9 @@ func (mset *stream) setupMirrorConsumer() error {
 		subject = strings.Replace(subject, JSApiPrefix, ext.ApiPrefix, 1)
 		subject = strings.ReplaceAll(subject, "..", ".")
 	}
+
+	// Marshal now that we are done with `req`.
+	b, _ := json.Marshal(req)
 
 	// Reset
 	mirror.msgs = nil
@@ -2958,7 +2978,7 @@ func (mset *stream) setupMirrorConsumer() error {
 					// Check to see if delivered is past our last and we have no msgs. This will help the
 					// case when mirroring a stream that has a very high starting sequence number.
 					if state.Msgs == 0 && ccr.ConsumerInfo.Delivered.Stream > state.LastSeq {
-						mset.store.PurgeEx(_EMPTY_, ccr.ConsumerInfo.Delivered.Stream+1, 0, true)
+						mset.store.PurgeEx(_EMPTY_, ccr.ConsumerInfo.Delivered.Stream+1, 0)
 						mset.lseq = ccr.ConsumerInfo.Delivered.Stream
 					} else {
 						mset.skipMsgs(state.LastSeq+1, ccr.ConsumerInfo.Delivered.Stream)
@@ -4115,6 +4135,18 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig) error {
 	}
 	// This will fire the callback but we do not require the lock since md will be 0 here.
 	mset.store.RegisterStorageUpdates(mset.storeUpdates)
+	mset.store.RegisterStorageRemoveMsg(func(seq uint64) {
+		if mset.IsClustered() {
+			if mset.IsLeader() {
+				mset.mu.RLock()
+				md := streamMsgDelete{Seq: seq, NoErase: true, Stream: mset.cfg.Name}
+				mset.node.Propose(encodeMsgDelete(&md))
+				mset.mu.RUnlock()
+			}
+		} else {
+			mset.removeMsg(seq)
+		}
+	})
 	mset.store.RegisterSubjectDeleteMarkerUpdates(func(im *inMsg) {
 		if mset.IsClustered() {
 			if mset.IsLeader() {
@@ -5633,7 +5665,7 @@ func (mset *stream) resetAndWaitOnConsumers() {
 	for _, o := range consumers {
 		if node := o.raftNode(); node != nil {
 			node.StepDown()
-			node.Delete()
+			node.Stop()
 		}
 		if o.isMonitorRunning() {
 			o.monitorWg.Wait()
@@ -6313,6 +6345,10 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	if err != nil {
 		return nil, err
 	}
+	js := jsa.js
+	if js == nil {
+		return nil, NewJSNotEnabledForAccountError()
+	}
 
 	cfg, apiErr := s.checkStreamCfg(ncfg, a, false)
 	if apiErr != nil {
@@ -6347,6 +6383,22 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	}
 	sdirCheck := filepath.Clean(sdir) + string(os.PathSeparator)
 
+	_, isClustered := jsa.jetStreamAndClustered()
+	jsa.usageMu.RLock()
+	selected, tier, hasTier := jsa.selectLimits(cfg.Replicas)
+	jsa.usageMu.RUnlock()
+	reserved := int64(0)
+	if hasTier {
+		if isClustered {
+			js.mu.RLock()
+			_, reserved = tieredStreamAndReservationCount(js.cluster.streams[a.Name], tier, &cfg)
+			js.mu.RUnlock()
+		} else {
+			reserved = jsa.tieredReservation(tier, &cfg)
+		}
+	}
+
+	var bc int64
 	tr := tar.NewReader(s2.NewReader(r))
 	for {
 		hdr, err := tr.Next()
@@ -6358,6 +6410,13 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			return nil, logAndReturnError()
+		}
+		bc += hdr.Size
+		js.mu.RLock()
+		err = js.checkAllLimits(&selected, &cfg, reserved, bc)
+		js.mu.RUnlock()
+		if err != nil {
+			return nil, err
 		}
 		fpath := filepath.Join(sdir, filepath.Clean(hdr.Name))
 		if !strings.HasPrefix(fpath, sdirCheck) {
