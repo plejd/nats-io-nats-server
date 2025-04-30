@@ -4602,9 +4602,9 @@ func (fs *fileStore) EraseMsg(seq uint64) (bool, error) {
 
 // Convenience function to remove per subject tracking at the filestore level.
 // Lock should be held.
-func (fs *fileStore) removePerSubject(subj string) {
+func (fs *fileStore) removePerSubject(subj string) uint64 {
 	if len(subj) == 0 || fs.psim == nil {
-		return
+		return 0
 	}
 	// We do not update sense of fblk here but will do so when we resolve during lookup.
 	bsubj := stringToBytes(subj)
@@ -4615,10 +4615,12 @@ func (fs *fileStore) removePerSubject(subj string) {
 		} else if info.total == 0 {
 			if _, ok = fs.psim.Delete(bsubj); ok {
 				fs.tsl -= len(subj)
-				return
+				return 0
 			}
 		}
+		return info.total
 	}
+	return 0
 }
 
 // Remove a message, optionally rewriting the mb file.
@@ -5644,23 +5646,26 @@ func (fs *fileStore) expireMsgs() {
 	var ttlSdm map[string][]SDMBySubj
 	if fs.ttls != nil {
 		fs.ttls.ExpireTasks(func(seq uint64, ts int64) bool {
+			// Need to grab subject for the specified sequence if for SDM, and check
+			// if the message hasn't been removed in the meantime.
+			sm, _ = fs.msgForSeqLocked(seq, &smv, false)
+			if sm == nil {
+				return true
+			}
+
 			if sdmEnabled {
-				// Need to grab subject for the specified sequence, and check
-				// if the message hasn't been removed in the meantime.
-				sm, _ = fs.msgForSeqLocked(seq, &smv, false)
-				if sm != nil {
-					if ttlSdm == nil {
-						ttlSdm = make(map[string][]SDMBySubj, 1)
-					}
-					ttlSdm[sm.subj] = append(ttlSdm[sm.subj], SDMBySubj{seq, len(getHeader(JSMarkerReason, sm.hdr)) != 0})
-					return false
+				if ttlSdm == nil {
+					ttlSdm = make(map[string][]SDMBySubj, 1)
 				}
+				ttlSdm[sm.subj] = append(ttlSdm[sm.subj], SDMBySubj{seq, len(getHeader(JSMarkerReason, sm.hdr)) != 0})
 			} else {
 				// Collect sequences to remove. Don't remove messages inline here,
 				// as that releases the lock and THW is not thread-safe.
 				rmSeqs = append(rmSeqs, seq)
 			}
-			return true
+			// Removing messages out of band, those can fail, and we can be shutdown halfway
+			// through so don't remove from THW just yet.
+			return false
 		})
 		if maxAge > 0 {
 			// Only check if we're expiring something in the next MaxAge interval, saves us a bit
@@ -5753,7 +5758,7 @@ func (fs *fileStore) handleRemovalOrSdm(seq uint64, subj string, sdm bool, sdmTT
 		var _hdr [128]byte
 		hdr := fmt.Appendf(
 			_hdr[:0],
-			"NATS/1.0\r\n%s: %s\r\n%s: %s\r\n%s: %s\r\n\r\n\r\n",
+			"NATS/1.0\r\n%s: %s\r\n%s: %s\r\n%s: %s\r\n\r\n",
 			JSMarkerReason, JSMarkerReasonMaxAge,
 			JSMessageTTL, time.Duration(sdmTTL)*time.Second,
 			JSMsgRollup, JSMsgRollupSubject,
@@ -5834,6 +5839,14 @@ func (mb *msgBlock) enableForWriting(fip bool) error {
 // Helper function to place a delete tombstone.
 func (mb *msgBlock) writeTombstone(seq uint64, ts int64) error {
 	return mb.writeMsgRecord(emptyRecordLen, seq|tbit, _EMPTY_, nil, nil, ts, true)
+}
+
+// Helper function to place a delete tombstone without flush.
+// Lock should not be held.
+func (mb *msgBlock) writeTombstoneNoFlush(seq uint64, ts int64) error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	return mb.writeMsgRecordLocked(emptyRecordLen, seq|tbit, _EMPTY_, nil, nil, ts, false, false)
 }
 
 // Will write the message record to the underlying message block.
@@ -6075,10 +6088,13 @@ func (fs *fileStore) checkLastBlock(rl uint64) (lmb *msgBlock, err error) {
 	lmb = fs.lmb
 	rbytes := lmb.blkSize()
 	if lmb == nil || (rbytes > 0 && rbytes+rl > fs.fcfg.BlockSize) {
-		if lmb != nil && fs.fcfg.Compression != NoCompression {
-			// We've now reached the end of this message block, if we want
-			// to compress blocks then now's the time to do it.
-			go lmb.recompressOnDiskIfNeeded()
+		if lmb != nil {
+			lmb.flushPendingMsgs()
+			if fs.fcfg.Compression != NoCompression {
+				// We've now reached the end of this message block, if we want
+				// to compress blocks then now's the time to do it.
+				go lmb.recompressOnDiskIfNeeded()
+			}
 		}
 		if lmb, err = fs.newMsgBlockForWrite(); err != nil {
 			return nil, err
@@ -6124,18 +6140,12 @@ func (fs *fileStore) writeTombstone(seq uint64, ts int64) error {
 // This version does not flush contents.
 // Lock should be held.
 func (fs *fileStore) writeTombstoneNoFlush(seq uint64, ts int64) error {
-	// Grab our current last message block.
-	olmb := fs.lmb
 	lmb, err := fs.checkLastBlock(emptyRecordLen)
 	if err != nil {
 		return err
 	}
-	// If we swapped out our lmb, flush any pending.
-	if olmb != lmb {
-		olmb.flushPendingMsgs()
-	}
 	// Write tombstone without flush or kick.
-	return lmb.writeTombstone(seq, ts)
+	return lmb.writeTombstoneNoFlush(seq, ts)
 }
 
 func (mb *msgBlock) recompressOnDiskIfNeeded() error {
@@ -7942,6 +7952,11 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		}
 	}
 
+	// Make sure to not leave subject if empty and we reach this spot.
+	if subject == _EMPTY_ {
+		subject = fwcs
+	}
+
 	eq, wc := compareFn(subject), subjectHasWildcard(subject)
 	var firstSeqNeedsUpdate bool
 	var bytes uint64
@@ -7990,6 +8005,8 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 			shouldExpire = true
 		}
 
+		var nrg uint64 // Number of remaining messages globally after removal from psim.
+
 		for seq, te := f, len(tombs); seq <= l; seq++ {
 			if sm, _ := mb.cacheLookupNoCopy(seq, &smv); sm != nil && eq(sm.subj, subject) {
 				rl := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
@@ -8013,8 +8030,8 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 					bytes += rl
 				}
 				// PSIM and FSS updates.
-				mb.removeSeqPerSubject(sm.subj, seq)
-				fs.removePerSubject(sm.subj)
+				nr := mb.removeSeqPerSubject(sm.subj, seq)
+				nrg = fs.removePerSubject(sm.subj)
 
 				// Track tombstones we need to write.
 				tombs = append(tombs, msgId{sm.seq, sm.ts})
@@ -8044,6 +8061,11 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 				if mb.isEmpty() || (maxp > 0 && purged >= maxp) {
 					break
 				}
+				// Also break if we know we have no more messages matching here.
+				// This is only applicable for non-wildcarded filters.
+				if !wc && nr == 0 {
+					break
+				}
 			}
 		}
 		// Expire if we were responsible for loading and we do not seem to be doing successive purgeEx calls.
@@ -8056,6 +8078,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 
 		// Check if we should break out of top level too.
 		if maxp > 0 && purged >= maxp {
+			break
+		}
+		// Also check if not wildcarded and we have no remaining matches.
+		if !wc && nrg == 0 {
 			break
 		}
 	}
@@ -8074,6 +8100,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 				return purged, err
 			}
 		}
+		// Flush any pending. If we change blocks the checkLastBlock() will flush any pending for us.
 		if lmb := fs.lmb; lmb != nil {
 			lmb.flushPendingMsgs()
 		}
@@ -8727,21 +8754,21 @@ func (mb *msgBlock) dirtyCloseWithRemove(remove bool) error {
 
 // Remove a seq from the fss and select new first.
 // Lock should be held.
-func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) {
+func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) uint64 {
 	mb.ensurePerSubjectInfoLoaded()
 	if mb.fss == nil {
-		return
+		return 0
 	}
 	bsubj := stringToBytes(subj)
 	ss, ok := mb.fss.Find(bsubj)
 	if !ok || ss == nil {
-		return
+		return 0
 	}
 
 	mb.fs.sdm.removeSeqAndSubject(seq, subj)
 	if ss.Msgs == 1 {
 		mb.fss.Delete(bsubj)
-		return
+		return 0
 	}
 
 	ss.Msgs--
@@ -8751,18 +8778,20 @@ func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) {
 		if !ss.lastNeedsUpdate && seq != ss.Last {
 			ss.First = ss.Last
 			ss.firstNeedsUpdate = false
-			return
+			return 1
 		}
 		if !ss.firstNeedsUpdate && seq != ss.First {
 			ss.Last = ss.First
 			ss.lastNeedsUpdate = false
-			return
+			return 1
 		}
 	}
 
 	// We can lazily calculate the first/last sequence when needed.
 	ss.firstNeedsUpdate = seq == ss.First || ss.firstNeedsUpdate
 	ss.lastNeedsUpdate = seq == ss.Last || ss.lastNeedsUpdate
+
+	return ss.Msgs
 }
 
 // Will recalculate the first and/or last sequence for this subject in this block.
