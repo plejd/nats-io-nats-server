@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   RACE: ${{ (github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') && github.event_name != 'pull_request') && '-race' || '' }}
 
@@ -16,9 +19,10 @@ jobs:
   signoffs:
     name: Sign-offs
     runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    if: github.ref != 'refs/heads/main'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -26,8 +30,9 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           for c in $(git rev-list --no-merges ${{ github.event.before }}..${{ github.event.after }}); do
-            if ! git log -1 --pretty=%B "$c" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by:\` line"
+            msg="$(git log -1 --pretty=%B "$c")"
+            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
+              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by: Your Name <your.email@example.com>\` line"
               git log -1 --pretty=format:"%h %s" "$c"
               missing=1
             fi
@@ -38,8 +43,9 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           for c in $(git rev-list origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}); do
-            if ! git log -1 --pretty=%B "$c" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by:\` line"
+            msg="$(git log -1 --pretty=%B "$c")"
+            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
+              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by: Your Name <your.email@example.com>\` line"
               git log -1 --pretty=format:"%h %s" "$c"
               missing=1
             fi
@@ -48,30 +54,32 @@ jobs:
 
       - name: Check PR description is signed off
         if: github.event_name == 'pull_request'
+        env:
+          PR_DESC: ${{ github.event.pull_request.body }}
         run: |
-          if ! echo "${{ github.event.pull_request.body }}" | grep -Pq '^Signed-off-by:\s*(?!Your Name|.*<your\.email@example\.com>)'; then
-              echo "::error ::Pull request has not been signed off in the PR description with a \`Signed-off-by:\` line"
-              exit 1
-          fi
+          grep -Pq '^Signed-off-by:\s*(?!Your Name|.*<your\.email@example\.com>)' <<<"$PR_DESC" || {
+          echo "::error ::Pull request has not been signed off in the PR description with a \`Signed-off-by:\` line"
+          exit 1
+          }
 
   lint:
     name: Lint
     runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: "go.mod"
 
       - name: Run golangci-lint
         # Use commit hash here to avoid a re-tagging attack, as this is a third-party action
         # Commit 1481404843c368bc19ca9406f87d6e0fc97bdcfd = tag v7.0.0
         uses: golangci/golangci-lint-action@1481404843c368bc19ca9406f87d6e0fc97bdcfd
         with:
-          version: v2.1.2
+          version: v2.3.1
           skip-cache: true
           skip-save-cache: true
           args: --timeout=5m --config=.golangci.yml
@@ -81,30 +89,36 @@ jobs:
     runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
         with:
           go-version: stable
 
-      - name: Build NATS Server
-        run: go build
+      - name: Build NATS Server 64-bit
+        run: GOARCH=amd64 GOOS=linux go build
+
+      - name: Build NATS Server 32-bit
+        run: GOARCH=386 GOOS=linux go build
 
   build-supported:
     name: Build (Minimum Go)
     runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
 
-      - name: Build NATS Server
-        run: go build
+      - name: Build NATS Server 64-bit
+        run: GOARCH=amd64 GOOS=linux go build
+
+      - name: Build NATS Server 32-bit
+        run: GOARCH=386 GOOS=linux go build
 
   # Using GitHub-supplied workers for Windows for now.
   # Note that the below testing steps depend on the Linux build
@@ -114,11 +128,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2019, windows-2022]
+        os: [windows-2022, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -135,7 +149,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -152,7 +166,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -169,7 +183,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -186,7 +200,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -203,7 +217,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -220,7 +234,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -237,7 +251,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -254,7 +268,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -271,7 +285,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -288,7 +302,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -305,7 +319,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -322,7 +336,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -339,7 +353,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -356,7 +370,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -373,7 +387,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -390,7 +404,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Go
         uses: actions/setup-go@v5

@@ -1,4 +1,4 @@
-// Copyright 2020-2024 The NATS Authors
+// Copyright 2020-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3292,7 +3293,7 @@ func TestJetStreamSuperClusterStreamDirectGetMirrorQueueGroup(t *testing.T) {
 		sl := sc.clusterForName("C3").streamLeader("$G", "M2")
 		if mset, err := sl.GlobalAccount().lookupStream("M2"); err == nil {
 			mset.mu.RLock()
-			ok := mset.mirror.dsub != nil
+			ok := mset.mirrorDirectSub != nil
 			mset.mu.RUnlock()
 			if ok {
 				return nil
@@ -3672,14 +3673,7 @@ func TestJetStreamSuperClusterDoubleStreamMove(t *testing.T) {
 				js.mu.Unlock()
 				return fmt.Errorf("durable not found in stream")
 			} else {
-				found := false
-				for _, peer := range ca.Group.Peers {
-					if peer == sExpHash {
-						found = true
-						break
-					}
-				}
-				if !found {
+				if !slices.Contains(ca.Group.Peers, sExpHash) {
 					js.mu.Unlock()
 					return fmt.Errorf("consumer expected peer %s/%s bud didn't find in %+v",
 						sExpHash, sExpected, ca.Group.Peers)
@@ -3707,8 +3701,8 @@ func TestJetStreamSuperClusterDoubleStreamMove(t *testing.T) {
 			if si, err := js.StreamInfo("TEST", nats.MaxWait(time.Second)); err != nil {
 				return fmt.Errorf("could not fetch stream info: %v", err)
 			} else if len(si.Cluster.Replicas)+1 != si.Config.Replicas {
-				return fmt.Errorf("not yet downsized replica should be empty has: %d %s",
-					len(si.Cluster.Replicas), si.Cluster.Leader)
+				return fmt.Errorf("not yet downsized replica should be empty has: %d != %d (%s)",
+					len(si.Cluster.Replicas)+1, si.Config.Replicas, si.Cluster.Leader)
 			} else if si.Cluster.Leader == _EMPTY_ {
 				return fmt.Errorf("leader not found")
 			} else if len(expectedSet) > 0 {

@@ -1,4 +1,4 @@
-// Copyright 2018-2024 The NATS Authors
+// Copyright 2018-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -7127,6 +7127,24 @@ func TestDefaultSentinelUser(t *testing.T) {
 	require_NoError(t, err)
 
 	aKP, aPub, aAC := NewJwtAccountClaim("A")
+	aScopedKP, err := nkeys.CreateAccount()
+	require_NoError(t, err)
+	aScopedPK, err := aScopedKP.PublicKey()
+	require_NoError(t, err)
+
+	sentinelScope := jwt.NewUserScope()
+	sentinelScope.Key = aScopedPK
+	sentinelScope.Role = "sentinel"
+	sentinelScope.Description = "Sentinel Role"
+	sentinelScope.Template = jwt.UserPermissionLimits{
+		BearerToken: true,
+		Permissions: jwt.Permissions{
+			Pub: jwt.Permission{Deny: []string{">"}},
+			Sub: jwt.Permission{Deny: []string{">"}},
+		},
+	}
+	aAC.SigningKeys.AddScopedSigner(sentinelScope)
+
 	preload[aPub], err = aAC.Encode(oKp)
 	require_NoError(t, err)
 
@@ -7155,7 +7173,7 @@ func TestDefaultSentinelUser(t *testing.T) {
 	uPub, err := uKP.PublicKey()
 	require_NoError(t, err)
 	uc := jwt.NewUserClaims(uPub)
-	uc.BearerToken = true
+	uc.BearerToken = false
 	uc.Name = "sentinel"
 	sentinelToken, err := uc.Encode(aKP)
 	require_NoError(t, err)
@@ -7168,8 +7186,26 @@ func TestDefaultSentinelUser(t *testing.T) {
 			default_sentinel: %s
 `, ojwt, sysPub, preloadConfig, sentinelToken)))
 
+	// test non-bearer sentinel is rejected
+	opts, err := ProcessConfigFile(conf)
+	require_NoError(t, err)
+	_, err = NewServer(opts)
+	require_Error(t, err, fmt.Errorf("default sentinel must be a bearer token"))
+
+	// correct and start server
+	uc.BearerToken = true
+	sentinelToken, err = uc.Encode(aKP)
+	require_NoError(t, err)
+	conf = createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken)))
+
 	ns, _ = RunServerWithConfig(conf)
-	defer ns.Shutdown()
 	nc, err := nats.Connect(ns.ClientURL())
 	require_NoError(t, err)
 	defer nc.Close()
@@ -7182,6 +7218,29 @@ func TestDefaultSentinelUser(t *testing.T) {
 	var ui SR
 	require_NoError(t, json.Unmarshal(r.Data, &ui))
 	require_Equal(t, ui.Data.UserID, uPub)
+	ns.Shutdown()
+
+	// now lets make a sentinel that is a scoped user with bearer token
+	uc = jwt.NewUserClaims(uPub)
+	uc.IssuerAccount = aPub
+	uc.UserPermissionLimits = jwt.UserPermissionLimits{}
+
+	sentinelToken, err = uc.Encode(aScopedKP)
+	require_NoError(t, err)
+	conf = createConfFile(t, []byte(fmt.Sprintf(`
+            listen: 127.0.0.1:4747
+            operator: %s
+            system_account: %s
+            resolver: MEM
+            resolver_preload: %s
+			default_sentinel: %s
+`, ojwt, sysPub, preloadConfig, sentinelToken)))
+	ns, _ = RunServerWithConfig(conf)
+	defer ns.Shutdown()
+	nc, err = nats.Connect(ns.ClientURL())
+	require_NoError(t, err)
+	defer nc.Close()
+
 }
 
 func TestJWTUpdateAccountClaimsStreamAndServiceImportDeadlock(t *testing.T) {
@@ -7346,4 +7405,61 @@ func TestJWTJetStreamClientsExcludedForMaxConnsUpdate(t *testing.T) {
 
 	_, err = js.Publish("foo", nil)
 	require_NoError(t, err)
+}
+
+func TestJWTClusterUserInfoContainsPermissions(t *testing.T) {
+	tmpl := `
+			listen: 127.0.0.1:-1
+			server_name: %s
+			jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+			cluster {
+				name: %s
+				listen: 127.0.0.1:%d
+				routes = [%s]
+			}
+	`
+	opFrag := `
+			operator: %s
+			system_account: %s
+			resolver: { type: MEM }
+			resolver_preload = {
+				%s : %s
+				%s : %s
+			}
+		`
+
+	_, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+
+	accKp, aExpPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(aExpPub)
+	accClaim.DefaultPermissions.Sub = jwt.Permission{
+		Deny: []string{"foo"},
+	}
+	accJwt := encodeClaim(t, accClaim, aExpPub)
+	accCreds := newUser(t, accKp)
+
+	template := tmpl + fmt.Sprintf(opFrag, ojwt, syspub, syspub, sysJwt, aExpPub, accJwt)
+	c := createJetStreamClusterWithTemplate(t, template, "R3S", 3)
+	defer c.shutdown()
+
+	// Since it's a bit of a race whether the local server responds via the
+	// service import before a remote server does, we need to keep trying.
+	// In 1000 attempts it is quite easy to reproduce the problem.
+	test := func() {
+		nc, _ := jsClientConnect(t, c.randomServer(), nats.UserCredentials(accCreds))
+		defer nc.Close()
+
+		resp, err := nc.Request(userDirectInfoSubj, nil, time.Second)
+		require_NoError(t, err)
+
+		response := ServerAPIResponse{Data: &UserInfo{}}
+		require_NoError(t, json.Unmarshal(resp.Data, &response))
+
+		userInfo := response.Data.(*UserInfo)
+		require_NotNil(t, userInfo.Permissions)
+	}
+	for range 1000 {
+		test()
+	}
 }

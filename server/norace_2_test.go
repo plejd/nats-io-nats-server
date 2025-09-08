@@ -37,6 +37,7 @@ import (
 
 	crand "crypto/rand"
 
+	"github.com/nats-io/nats-server/v2/server/gsl"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
 )
@@ -1235,6 +1236,15 @@ func TestNoRaceJetStreamKVReplaceWithServerRestart(t *testing.T) {
 	})
 	require_NoError(t, err)
 
+	// Manually disable direct get on underlying stream, since this test
+	// relies on immediate consistency which we can't guarantee with direct gets
+	// until we provide a solution for this.
+	si, err := js.StreamInfo("KV_TEST")
+	require_NoError(t, err)
+	si.Config.AllowDirect = false
+	_, err = js.UpdateStream(&si.Config)
+	require_NoError(t, err)
+
 	createData := func(n int) []byte {
 		const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 		b := make([]byte, n)
@@ -1246,6 +1256,11 @@ func TestNoRaceJetStreamKVReplaceWithServerRestart(t *testing.T) {
 
 	_, err = kv.Create("foo", createData(160))
 	require_NoError(t, err)
+
+	// Ensure all replicas have applied the key.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "KV_TEST")
+	})
 
 	ch := make(chan struct{})
 	wg := sync.WaitGroup{}
@@ -1263,6 +1278,7 @@ func TestNoRaceJetStreamKVReplaceWithServerRestart(t *testing.T) {
 		for {
 			select {
 			case <-ch:
+				close(errCh)
 				return
 			default:
 				k, err := kv.Get("foo")
@@ -1285,7 +1301,7 @@ func TestNoRaceJetStreamKVReplaceWithServerRestart(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	for _, s := range c.servers {
 		s.Shutdown()
-		// Need to leave servers down for awhile to trigger bug properly.
+		// Need to leave servers down for a while to trigger bug properly.
 		time.Sleep(5 * time.Second)
 		s = c.restartServer(s)
 		c.waitOnServerHealthz(s)
@@ -1840,8 +1856,8 @@ func TestNoRaceFileStoreMsgLoadNextMsgMultiPerf(t *testing.T) {
 	require_LessThan(t, elapsed, 2*baseline)
 
 	// Now do multi load next with 1 wc entry.
-	sl := NewSublistWithCache()
-	require_NoError(t, sl.Insert(&subscription{subject: []byte("foo.>")}))
+	sl := gsl.NewSublist[struct{}]()
+	require_NoError(t, sl.Insert("foo.>", struct{}{}))
 	start = time.Now()
 	for i, seq := 0, uint64(1); i < 1000; i++ {
 		sm, nseq, err := fs.LoadNextMsgMulti(sl, seq, &smv)
@@ -1855,10 +1871,10 @@ func TestNoRaceFileStoreMsgLoadNextMsgMultiPerf(t *testing.T) {
 	require_LessThan(t, elapsed, 2*baseline)
 
 	// Now do multi load next with 1000 literal subjects.
-	sl = NewSublistWithCache()
+	sl = gsl.NewSublist[struct{}]()
 	for i := 0; i < 1000; i++ {
 		subj := fmt.Sprintf("foo.%d", i)
-		require_NoError(t, sl.Insert(&subscription{subject: []byte(subj)}))
+		require_NoError(t, sl.Insert(subj, struct{}{}))
 	}
 	start = time.Now()
 	for i, seq := 0, uint64(1); i < 1000; i++ {
@@ -3065,12 +3081,12 @@ func TestNoRaceProducerStallLimits(t *testing.T) {
 	s, _ := RunServerWithConfig(conf)
 	defer s.Shutdown()
 
-	ncSlow := natsConnect(t, s.ClientURL())
+	ncSlow := natsConnect(t, s.ClientURL(), nats.Name("slow"))
 	defer ncSlow.Close()
 	natsSub(t, ncSlow, "foo", func(m *nats.Msg) { m.Respond([]byte("42")) })
 	natsFlush(t, ncSlow)
 
-	ncProd := natsConnect(t, s.ClientURL())
+	ncProd := natsConnect(t, s.ClientURL(), nats.Name("fast"))
 	defer ncProd.Close()
 
 	cid, err := ncSlow.GetClientID()
@@ -3113,6 +3129,41 @@ func TestNoRaceProducerStallLimits(t *testing.T) {
 	// Should always be close to totalAllowed (e.g. 10ms), but if you run a lot of them in one go can bump up
 	// just past it, hence the Max setting below to avoid a flapper.
 	require_LessThan(t, elapsed, stallTotalAllowed+20*time.Millisecond)
+
+	var tc *client
+	s.mu.Lock()
+	for _, client := range s.clients {
+		client.mu.Lock()
+		if client.opts.Name == "slow" {
+			tc = client
+			client.mu.Unlock()
+			break
+		}
+		client.mu.Unlock()
+	}
+	s.mu.Unlock()
+
+	// Verify counter was incremented.
+	totalStalls := atomic.LoadInt64(&tc.stalls)
+	if totalStalls == 0 {
+		t.Fatalf("Expected stalls count to be incremented, got: %d", totalStalls)
+	}
+
+	// Verify this shows up in Connz monitoring.
+	pconns := pollConnz(t, s, 1, "", nil)
+	var connzStalls int64
+	for _, conn := range pconns.Conns {
+		if conn.Cid == tc.cid {
+			connzStalls = conn.Stalls
+			break
+		}
+	}
+	if connzStalls < 1 {
+		t.Fatalf("Expected connz stalls count to be incremented, got: %d", connzStalls)
+	}
+	if s.NumStalledClients() < 1 {
+		t.Fatalf("Expected total stalled clients to be incremented, got: %d", s.NumStalledClients())
+	}
 }
 
 func TestNoRaceJetStreamClusterConsumerDeleteInterestPolicyPerf(t *testing.T) {
@@ -3394,4 +3445,37 @@ func TestNoRaceFileStorePurgeExAsyncTombstones(t *testing.T) {
 	// In testing this is like >200x
 	// With async and flush for all tombstones will be ~30x
 	require_True(t, elapsed*50 > elapsed2)
+}
+
+// Chck that we do not leak any go routines from access time optimization.
+func TestNoRaceAccessTimeLeakCheck(t *testing.T) {
+	time.Sleep(time.Second)
+	ngrp := runtime.NumGoroutine()
+
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.Publish("foo", []byte("Hello World"))
+	require_NoError(t, err)
+
+	// Close down client and server.
+	nc.Close()
+	s.Shutdown()
+	s.WaitForShutdown()
+
+	checkFor(t, 5*time.Second, time.Second, func() error {
+		if ngra := runtime.NumGoroutine(); ngrp != ngra {
+			return fmt.Errorf("expected %d, got %d", ngrp, ngra)
+		}
+		return nil
+	})
 }

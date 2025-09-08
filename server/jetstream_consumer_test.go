@@ -2170,27 +2170,30 @@ func TestJetStreamConsumerWithPriorityGroups(t *testing.T) {
 	cluster.waitOnStreamLeader("$G", "TEST")
 
 	for _, test := range []struct {
-		name     string
-		nc       *nats.Conn
-		stream   string
-		consumer string
-		groups   []string
-		mode     PriorityPolicy
-		err      *ApiError
+		name           string
+		nc             *nats.Conn
+		stream         string
+		consumer       string
+		groups         []string
+		mode           PriorityPolicy
+		deliverSubject string
+		err            *ApiError
 	}{
-		{"Pinned Consumer with Priority Group", nc, "TEST", "PINNED", []string{"A"}, PriorityPinnedClient, nil},
-		{"Pinned Consumer with Priority Group, clustered", cnc, "TEST", "PINNED", []string{"A"}, PriorityPinnedClient, nil},
-		{"Overflow Consumer with Priority Group", nc, "TEST", "OVERFLOW", []string{"A"}, PriorityOverflow, nil},
-		{"Overflow Consumer with Priority Group, clustered", cnc, "TEST", "OVERFLOW", []string{"A"}, PriorityOverflow, nil},
-		{"Pinned Consumer without Priority Group", nc, "TEST", "PINNED_NO_GROUP", nil, PriorityPinnedClient, &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
-		{"Pinned Consumer without Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", nil, PriorityPinnedClient, &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
-		{"Overflow Consumer without Priority Group", nc, "TEST", "PINNED_NO_GROUP", nil, PriorityOverflow, &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
-		{"Overflow Consumer without Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", nil, PriorityOverflow, &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
-		{"Pinned Consumer with empty Priority Group", nc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityPinnedClient, &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
-		{"Pinned Consumer with empty Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityPinnedClient, &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
-		{"Pinned Consumer with empty Priority Group", nc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityOverflow, &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
-		{"Pinned Consumer with empty Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityOverflow, &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
-		{"Consumer with `none` policy priority", nc, "TEST", "NONE", []string{"A"}, PriorityNone, nil},
+		{"Pinned Consumer with Priority Group", nc, "TEST", "PINNED", []string{"A"}, PriorityPinnedClient, "", nil},
+		{"Pinned Consumer with Priority Group, clustered", cnc, "TEST", "PINNED", []string{"A"}, PriorityPinnedClient, "", nil},
+		{"Overflow Consumer with Priority Group", nc, "TEST", "OVERFLOW", []string{"A"}, PriorityOverflow, "", nil},
+		{"Overflow Consumer with Priority Group, clustered", cnc, "TEST", "OVERFLOW", []string{"A"}, PriorityOverflow, "", nil},
+		{"Pinned Consumer without Priority Group", nc, "TEST", "PINNED_NO_GROUP", nil, PriorityPinnedClient, "", &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
+		{"Pinned Consumer without Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", nil, PriorityPinnedClient, "", &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
+		{"Overflow Consumer without Priority Group", nc, "TEST", "PINNED_NO_GROUP", nil, PriorityOverflow, "", &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
+		{"Overflow Consumer without Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", nil, PriorityOverflow, "", &ApiError{ErrCode: uint16(JSConsumerPriorityPolicyWithoutGroup)}},
+		{"Pinned Consumer with empty Priority Group", nc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityPinnedClient, "", &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
+		{"Pinned Consumer with empty Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityPinnedClient, "", &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
+		{"Pinned Consumer with empty Priority Group", nc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityOverflow, "", &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
+		{"Pinned Consumer with empty Priority Group, clustered", cnc, "TEST", "PINNED_NO_GROUP", []string{""}, PriorityOverflow, "", &ApiError{ErrCode: uint16(JSConsumerEmptyGroupName)}},
+		{"Consumer with `none` policy priority and no pinned TTL set", nc, "TEST", "NONE", []string{}, PriorityNone, "", &ApiError{ErrCode: uint16(JSConsumerPinnedTTLWithoutPriorityPolicyNone)}},
+		{"Consumer with `none` policy priority and Priority Group set", nc, "TEST", "NONE_WITH_GROUPS", []string{"A"}, PriorityNone, "", &ApiError{ErrCode: uint16(JSConsumerPriorityGroupWithPolicyNone)}},
+		{"Push consumer with Priority Group", nc, "TEST", "PUSH_WITH_POLICY", []string{"A"}, PriorityOverflow, "subject", &ApiError{ErrCode: uint16(JSConsumerPushWithPriorityGroupErr)}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 
@@ -2203,6 +2206,7 @@ func TestJetStreamConsumerWithPriorityGroups(t *testing.T) {
 					PriorityGroups: test.groups,
 					PriorityPolicy: test.mode,
 					AckPolicy:      AckExplicit,
+					DeliverSubject: test.deliverSubject,
 					PinnedTTL:      10 * time.Second,
 				},
 			}
@@ -8384,6 +8388,50 @@ func TestJetStreamConsumerPullMaxWaitingOfOne(t *testing.T) {
 	}
 }
 
+func TestJetStreamConsumerPullMaxWaitingOfOneWithHeartbeatInterval(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"TEST.A"}})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:    "dur",
+		MaxWaiting: 1,
+		AckPolicy:  nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	// First check that a request can timeout (we had an issue where this was
+	// not the case for MaxWaiting of 1).
+	req := JSApiConsumerGetNextRequest{Batch: 1, Expires: 250 * time.Millisecond}
+	reqb, _ := json.Marshal(req)
+	msg, err := nc.Request("$JS.API.CONSUMER.MSG.NEXT.TEST.dur", reqb, 13000*time.Millisecond)
+	require_NoError(t, err)
+	if v := msg.Header.Get("Status"); v != "408" {
+		t.Fatalf("Expected 408, got: %s", v)
+	}
+
+	// Now have a request waiting...
+	req = JSApiConsumerGetNextRequest{Batch: 1}
+	reqb, _ = json.Marshal(req)
+	// Send the request, but do not block since we want then to send an extra
+	// request that should be rejected.
+	sub := natsSubSync(t, nc, nats.NewInbox())
+	err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.dur", sub.Subject, reqb)
+	require_NoError(t, err)
+
+	// Send a new request, this should not respond since we specified an idle heartbeat,
+	// therefore the client will just expect to miss those instead.
+	req = JSApiConsumerGetNextRequest{Batch: 1, Expires: 500 * time.Millisecond, Heartbeat: 250 * time.Millisecond}
+	reqb, _ = json.Marshal(req)
+	_, err = nc.Request("$JS.API.CONSUMER.MSG.NEXT.TEST.dur", reqb, 300*time.Millisecond)
+	require_Error(t, err)
+}
+
 func TestJetStreamConsumerPullMaxWaiting(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
@@ -9641,4 +9689,600 @@ func TestJetStreamConsumerStateAlwaysFromStore(t *testing.T) {
 	require_NoError(t, err)
 	require_Equal(t, ci.Delivered.Stream, 1)
 	require_Equal(t, ci.AckFloor.Stream, 1)
+}
+
+func TestJetStreamConsumerPullNoWaitBatchLargerThanPending(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:       "C",
+			AckPolicy:     nats.AckExplicitPolicy,
+			FilterSubject: "foo",
+			Replicas:      replicas,
+		})
+		require_NoError(t, err)
+
+		req := JSApiConsumerGetNextRequest{Batch: 10, NoWait: true}
+
+		for range 5 {
+			_, err := js.Publish("foo", []byte("OK"))
+			require_NoError(t, err)
+		}
+
+		sub := sendRequest(t, nc, "rply", req)
+		defer sub.Unsubscribe()
+
+		// Should get all 5 messages.
+		for range 5 {
+			msg, err := sub.NextMsg(time.Second)
+			require_NoError(t, err)
+			if len(msg.Data) == 0 && msg.Header != nil {
+				t.Fatalf("Expected data, got: %s", msg.Header.Get("Description"))
+			}
+		}
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamConsumerNotInactiveDuringAckWait(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:           "CONSUMER",
+			AckPolicy:         nats.AckExplicitPolicy,
+			Replicas:          replicas,
+			InactiveThreshold: 500 * time.Millisecond, // Pull mode adds up to 1 second randomly.
+			AckWait:           time.Minute,
+		})
+		require_NoError(t, err)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+
+		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER", nats.BindStream("TEST"))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		msgs, err := sub.Fetch(1)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+
+		// AckWait is still active, so must not delete the consumer while waiting for an ack.
+		time.Sleep(1750 * time.Millisecond)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_NoError(t, msgs[0].AckSync())
+
+		// Not waiting on AckWait anymore, consumer is deleted after the inactivity threshold.
+		time.Sleep(1750 * time.Millisecond)
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_Error(t, err, nats.ErrConsumerNotFound)
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
+	test := func(t *testing.T, replicas int) {
+		c := createJetStreamClusterExplicit(t, "R3S", 3)
+		defer c.shutdown()
+
+		nc, js := jsClientConnect(t, c.randomServer())
+		defer nc.Close()
+
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"foo"},
+			Replicas: replicas,
+		})
+		require_NoError(t, err)
+
+		_, err = js.Publish("foo", nil)
+		require_NoError(t, err)
+
+		_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:           "CONSUMER",
+			AckPolicy:         nats.AckExplicitPolicy,
+			Replicas:          replicas,
+			InactiveThreshold: 500 * time.Millisecond, // Pull mode adds up to 1 second randomly.
+			BackOff: []time.Duration{
+				2 * time.Second,
+				4 * time.Second,
+			},
+		})
+		require_NoError(t, err)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+
+		sub, err := js.PullSubscribe(_EMPTY_, "CONSUMER", nats.BindStream("TEST"))
+		require_NoError(t, err)
+		defer sub.Drain()
+
+		msgs, err := sub.Fetch(1)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+
+		// AckWait is still active, so must not delete the consumer while waiting for an ack.
+		time.Sleep(1750 * time.Millisecond)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_NoError(t, msgs[0].Nak())
+
+		msgs, err = sub.Fetch(1)
+		require_NoError(t, err)
+		require_Len(t, len(msgs), 1)
+
+		// AckWait is still active, now based on backoff, so must not delete the consumer while waiting for an ack.
+		// We've confirmed can wait 2s AckWait + InactiveThreshold, now check we can also wait for the backoff.
+		time.Sleep(3750 * time.Millisecond)
+
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_NoError(t, msgs[0].AckSync())
+
+		// Not waiting on AckWait anymore, consumer is deleted after the inactivity threshold.
+		time.Sleep(1750 * time.Millisecond)
+		_, err = js.ConsumerInfo("TEST", "CONSUMER")
+		require_Error(t, err, nats.ErrConsumerNotFound)
+	}
+
+	t.Run("R1", func(t *testing.T) { test(t, 1) })
+	t.Run("R3", func(t *testing.T) { test(t, 3) })
+}
+
+func TestSortingConsumerPullRequests(t *testing.T) {
+
+	for _, test := range []struct {
+		name     string
+		requests []waitingRequest
+		expected []waitingRequest
+	}{
+		{
+			name: "sort",
+			requests: []waitingRequest{
+				{priorityGroup: &PriorityGroup{Priority: 1}},
+				{priorityGroup: &PriorityGroup{Priority: 2}},
+				{priorityGroup: &PriorityGroup{Priority: 1}},
+				{priorityGroup: &PriorityGroup{Priority: 3}},
+			},
+			expected: []waitingRequest{
+				{priorityGroup: &PriorityGroup{Priority: 1}},
+				{priorityGroup: &PriorityGroup{Priority: 1}},
+				{priorityGroup: &PriorityGroup{Priority: 2}},
+				{priorityGroup: &PriorityGroup{Priority: 3}},
+			},
+		},
+		{
+			name: "test if sort is stable",
+			requests: []waitingRequest{
+				{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1a"},
+				{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2a"},
+				{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1b"},
+				{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2b"},
+				{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1c"},
+				{priorityGroup: &PriorityGroup{Priority: 3}, reply: "3a"},
+				{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2c"},
+			},
+			expected: []waitingRequest{
+				{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1a"},
+				{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1b"},
+				{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1c"},
+				{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2a"},
+				{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2b"},
+				{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2c"},
+				{priorityGroup: &PriorityGroup{Priority: 3}, reply: "3a"},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Helper()
+
+			wq := newWaitQueue(100)
+
+			for _, r := range test.requests {
+				err := wq.addPrioritized(&r)
+				require_NoError(t, err)
+			}
+
+			if wq.n != len(test.expected) {
+				t.Fatalf("Expected %d requests, got %d", len(test.expected), wq.n)
+			}
+
+			// Verify order
+			for i, expected := range test.expected {
+				current := wq.peek()
+				if current == nil {
+					t.Fatalf("Expected request at position %d, but queue was empty", i)
+				}
+				if current.priorityGroup.Priority != expected.priorityGroup.Priority {
+					t.Fatalf("At position %d: expected priority %d, got %d",
+						i, expected.priorityGroup.Priority, current.priorityGroup.Priority)
+				}
+				if current.reply != expected.reply {
+					t.Fatalf("At position %d: expected reply %q, got %q", i, expected.reply, current.reply)
+				}
+				wq.removeCurrent()
+			}
+
+		})
+	}
+}
+
+func TestWaitQueuePopAndRequeue(t *testing.T) {
+	t.Run("basic requeue with batches", func(t *testing.T) {
+		wq := newWaitQueue(100)
+
+		// Add elements with different priorities
+		reqs := []waitingRequest{
+			{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1a", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1b", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1c", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2a", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2b", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2c", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 3}, reply: "3a", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 3}, reply: "3b", n: 3},
+			{priorityGroup: &PriorityGroup{Priority: 3}, reply: "3c", n: 3},
+		}
+
+		for i := range reqs {
+			err := wq.addPrioritized(&reqs[i])
+			require_NoError(t, err)
+		}
+
+		i := 0
+		j := 0
+		for {
+			wr := wq.popAndRequeue()
+			require_Equal(t, wr.reply, fmt.Sprintf("%da", j+1))
+			wr = wq.popAndRequeue()
+			require_Equal(t, wr.reply, fmt.Sprintf("%db", j+1))
+			wr = wq.popAndRequeue()
+			require_Equal(t, wr.reply, fmt.Sprintf("%dc", j+1))
+
+			i++
+			if i%3 == 0 {
+				j++
+			}
+			require_Equal(t, wq.n, 9-(j*3))
+			if j == 2 {
+				break
+			}
+		}
+	})
+
+	t.Run("request removal when fully served", func(t *testing.T) {
+		wq := newWaitQueue(100)
+
+		reqs := []waitingRequest{
+			{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1a", n: 2}, // Will be removed after 2 pops
+			{priorityGroup: &PriorityGroup{Priority: 1}, reply: "1b", n: 1}, // Will be removed after 1 pop
+			{priorityGroup: &PriorityGroup{Priority: 2}, reply: "2a", n: 3}, // Will remain
+		}
+
+		for i := range reqs {
+			err := wq.addPrioritized(&reqs[i])
+			require_NoError(t, err)
+		}
+		initialCount := wq.n
+
+		// Pop 1a first time (n=2 -> n=1, should requeue)
+		wr := wq.popAndRequeue()
+		if wr == nil || wr.reply != "1a" || wr.n != 1 {
+			t.Fatalf("Expected 1a with n=1, got %v with n=%d", wr, wr.n)
+		}
+		if wq.n != initialCount {
+			t.Fatalf("Queue size should remain %d, got %d", initialCount, wq.n)
+		}
+
+		// Pop 1b (n=1 -> n=0, should be removed)
+		wr = wq.popAndRequeue()
+		if wr == nil || wr.reply != "1b" || wr.n != 0 {
+			t.Fatalf("Expected 1b with n=0, got %v with n=%d", wr, wr.n)
+		}
+		if wq.n != initialCount-1 {
+			t.Fatalf("Queue size should be %d after 1b removal, got %d", initialCount-1, wq.n)
+		}
+
+		// Pop 1a second time (n=1 -> n=0, should be removed)
+		wr = wq.popAndRequeue()
+		if wr == nil || wr.reply != "1a" || wr.n != 0 {
+			t.Fatalf("Expected 1a with n=0, got %v with n=%d", wr, wr.n)
+		}
+		if wq.n != initialCount-2 {
+			t.Fatalf("Queue size should be %d after 1a removal, got %d", initialCount-2, wq.n)
+		}
+
+		// Only 2a should remain
+		next := wq.peek()
+		if next == nil || next.reply != "2a" || next.n != 3 {
+			t.Fatalf("Expected only 2a with n=3 to remain, got %v with n=%d", next, next.n)
+		}
+	})
+
+	t.Run("single element lifecycle", func(t *testing.T) {
+		wq := newWaitQueue(10)
+		req := waitingRequest{priorityGroup: &PriorityGroup{Priority: 1}, reply: "single", n: 2}
+		wq.add(&req)
+
+		// First pop (n=2 -> n=1, should stay)
+		result := wq.popAndRequeue()
+		if result == nil || result.reply != "single" || result.n != 1 {
+			t.Fatalf("Expected single with n=1, got %v with n=%d", result, result.n)
+		}
+		if wq.n != 1 {
+			t.Fatalf("Queue should still have 1 element, got %d", wq.n)
+		}
+
+		// Second pop (n=1 -> n=0, should be removed)
+		result = wq.popAndRequeue()
+		if result == nil || result.reply != "single" || result.n != 0 {
+			t.Fatalf("Expected single with n=0, got %v with n=%d", result, result.n)
+		}
+		if wq.n != 0 {
+			t.Fatalf("Queue should be empty after removal, got %d elements", wq.n)
+		}
+		if wq.head != nil {
+			t.Fatalf("Queue head should be nil after removal, got %v", wq.head)
+		}
+	})
+}
+
+func TestJetStreamConsumerPrioritized(t *testing.T) {
+
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	require_NoError(t, err)
+
+	acc, err := s.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+
+	_, err = mset.addConsumer(&ConsumerConfig{
+		Durable:        "CONSUMER",
+		AckPolicy:      AckNone,
+		FilterSubject:  "foo",
+		PriorityGroups: []string{"A"},
+		PriorityPolicy: PriorityPrioritized,
+	})
+	require_NoError(t, err)
+
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+
+	// Helper function to send pull request and get response
+	sendPullRequest := func(t *testing.T, inbox string, priority int, batch int) *nats.Subscription {
+		sub, err := nc.SubscribeSync(inbox)
+		require_NoError(t, err)
+
+		req := JSApiConsumerGetNextRequest{
+			Batch:   batch,
+			Expires: 10 * time.Second,
+			PriorityGroup: PriorityGroup{
+				Group:    "A",
+				Priority: priority,
+			},
+		}
+		reqb, _ := json.Marshal(req)
+		err = nc.PublishRequest("$JS.API.CONSUMER.MSG.NEXT.TEST.CONSUMER", inbox, reqb)
+		require_NoError(t, err)
+
+		return sub
+	}
+
+	t.Run("invalid priority number", func(t *testing.T) {
+
+		sub := sendPullRequest(t, "invalid_priority", 10, 1)
+
+		msg, err := sub.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_Equal(t, msg.Header.Get("Status"), "400")
+
+		sub2 := sendPullRequest(t, "invalid_priority", -5, 1)
+		require_Equal(t, msg.Header.Get("Status"), "400")
+
+		msg, err = sub2.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_Equal(t, msg.Header.Get("Status"), "400")
+
+	})
+
+	t.Run("priority ordering", func(t *testing.T) {
+		priority3 := sendPullRequest(t, "priority3", 3, 1) // Priority 3
+		priority1 := sendPullRequest(t, "priority1", 1, 1) // Priority 1 (should be served first)
+		priority2 := sendPullRequest(t, "priority2", 2, 2) // Priority 2
+
+		// Small delay to ensure requests are processed
+		time.Sleep(50 * time.Millisecond)
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "message"))
+		require_NoError(t, err)
+
+		// Priority 3 should time out
+		_, err := priority3.NextMsg(200 * time.Millisecond)
+		require_Error(t, err, nats.ErrTimeout)
+
+		// Priority 2 should time out
+		_, err = priority2.NextMsg(200 * time.Millisecond)
+		require_Error(t, err, nats.ErrTimeout)
+
+		// Priority 1 should get message first
+		msg, err := priority1.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "message"))
+		require_NoError(t, err)
+
+		// Priority 3 should time out.
+		_, err = priority3.NextMsg(200 * time.Millisecond)
+		require_Error(t, err, nats.ErrTimeout)
+
+		// Priority 2 should get message next
+		msg, err = priority2.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "message"))
+		require_NoError(t, err)
+
+		// Priority 2 should get message next
+		msg, err = priority2.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		// Priority 3 should time out
+		_, err = priority3.NextMsg(2 * time.Second)
+		require_Error(t, err, nats.ErrTimeout)
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "message"))
+		require_NoError(t, err)
+
+		// Priority 3 should get message next
+		msg, err = priority3.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+	})
+
+	t.Run("dynamic priority interruption", func(t *testing.T) {
+
+		inbox3 := nats.NewInbox()
+		sub3 := sendPullRequest(t, inbox3, 3, 3)
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
+		require_NoError(t, err)
+
+		msg, err := sub3.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		// Now, despite priority 3 still having pending messages, a new pull request
+		// with a lower priority should be able to take over the delivery.
+		inbox2 := nats.NewInbox()
+		sub2 := sendPullRequest(t, inbox2, 2, 2)
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
+		require_NoError(t, err)
+
+		msg, err = sub2.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		// The same should happen with priority 1.
+		inbox1 := nats.NewInbox()
+		sub1 := sendPullRequest(t, inbox1, 1, 1) // Priority 1, batch 3
+
+		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
+		require_NoError(t, err)
+		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
+		require_NoError(t, err)
+		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
+		require_NoError(t, err)
+
+		msg, err = sub1.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		// Now priority 2 should take over for last message.
+		msg, err = sub2.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+
+		// Finally, priority 3 should get its last message.
+		msg, err = sub3.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		require_NotNil(t, msg)
+	})
+}
+
+func TestJetStreamConsumerMaxDeliverUnderflow(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+
+	cfg := &nats.ConsumerConfig{Durable: "CONSUMER", MaxDeliver: -1}
+	_, err = js.AddConsumer("TEST", cfg)
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+
+	// Infinite MaxDeliver should be zero.
+	o.mu.RLock()
+	maxdc := o.maxdc
+	o.mu.RUnlock()
+	require_Equal(t, maxdc, 0)
+
+	// Finite MaxDeliver should be reported the same.
+	cfg.MaxDeliver = 1
+	_, err = js.UpdateConsumer("TEST", cfg)
+	require_NoError(t, err)
+	o.mu.RLock()
+	maxdc = o.maxdc
+	o.mu.RUnlock()
+	require_Equal(t, maxdc, 1)
+
+	// Infinite MaxDeliver should be zero.
+	cfg.MaxDeliver = -1
+	_, err = js.UpdateConsumer("TEST", cfg)
+	require_NoError(t, err)
+	o.mu.RLock()
+	maxdc = o.maxdc
+	o.mu.RUnlock()
+	require_Equal(t, maxdc, 0)
 }

@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/server/gsl"
 	"github.com/nats-io/nuid"
 )
 
@@ -401,11 +402,6 @@ func TestMemStoreStreamTruncate(t *testing.T) {
 
 	if state := ms.State(); state.Msgs != toStore {
 		t.Fatalf("Expected %d msgs, got %d", toStore, state.Msgs)
-	}
-
-	// Check that sequence has to be interior.
-	if err := ms.Truncate(toStore + 1); err != ErrInvalidSequence {
-		t.Fatalf("Expected err of '%v', got '%v'", ErrInvalidSequence, err)
 	}
 
 	if err := ms.Truncate(tseq); err != nil {
@@ -1107,11 +1103,11 @@ func TestMemStoreNumPendingMulti(t *testing.T) {
 	}
 
 	// Now we want to do a calculate NumPendingMulti.
-	filters := NewSublistNoCache()
+	filters := gsl.NewSublist[struct{}]()
 	for filters.Count() < uint32(numFiltered) {
 		filter := subjects[rand.Intn(totalSubjects)]
 		if !filters.HasInterest(filter) {
-			filters.Insert(&subscription{subject: []byte(filter)})
+			filters.Insert(filter, struct{}{})
 		}
 	}
 
@@ -1240,7 +1236,7 @@ func TestMemStoreSubjectDeleteMarkers(t *testing.T) {
 		_, err := fs.RemoveMsg(seq)
 		require_NoError(t, err)
 	}
-	fs.sdmcb = func(im *inMsg) {
+	fs.pmsgcb = func(im *inMsg) {
 		ch <- im
 	}
 
@@ -1290,6 +1286,80 @@ func TestMemStoreAllLastSeqs(t *testing.T) {
 	seqs, err := ms.AllLastSeqs()
 	require_NoError(t, err)
 	require_True(t, reflect.DeepEqual(seqs, expected))
+}
+
+func TestMemStoreUpdateConfigTTLState(t *testing.T) {
+	cfg := &StreamConfig{
+		Name:     "zzz",
+		Subjects: []string{">"},
+		Storage:  MemoryStorage,
+	}
+	ms, err := newMemStore(cfg)
+	require_NoError(t, err)
+	defer ms.Stop()
+	require_Equal(t, ms.ttls, nil)
+
+	cfg.AllowMsgTTL = true
+	require_NoError(t, ms.UpdateConfig(cfg))
+	require_NotEqual(t, ms.ttls, nil)
+
+	cfg.AllowMsgTTL = false
+	require_NoError(t, ms.UpdateConfig(cfg))
+	require_Equal(t, ms.ttls, nil)
+}
+
+func TestMemStoreSubjectForSeq(t *testing.T) {
+	cfg := StreamConfig{
+		Name:     "foo",
+		Subjects: []string{"foo.>"},
+		Storage:  MemoryStorage,
+	}
+	ms, err := newMemStore(&cfg)
+	require_NoError(t, err)
+
+	seq, _, err := ms.StoreMsg("foo.bar", nil, nil, 0)
+	require_NoError(t, err)
+	require_Equal(t, seq, 1)
+
+	_, err = ms.SubjectForSeq(0)
+	require_Error(t, err, ErrStoreMsgNotFound)
+
+	subj, err := ms.SubjectForSeq(1)
+	require_NoError(t, err)
+	require_Equal(t, subj, "foo.bar")
+
+	_, err = ms.SubjectForSeq(2)
+	require_Error(t, err, ErrStoreMsgNotFound)
+}
+
+func TestMemStoreMessageSchedule(t *testing.T) {
+	fs, err := newMemStore(
+		&StreamConfig{
+			Name: "TEST", Subjects: []string{"foo.*"}, Storage: MemoryStorage,
+			AllowMsgSchedules: true,
+		},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Capture message schedule proposals.
+	ch := make(chan *inMsg, 1)
+	fs.pmsgcb = func(im *inMsg) {
+		ch <- im
+	}
+
+	// Store a single message schedule.
+	schedule := time.Now().Add(time.Second).Format(time.RFC3339Nano)
+	hdr := genHeader(nil, JSSchedulePattern, fmt.Sprintf("@at %s", schedule))
+	hdr = genHeader(hdr, JSScheduleTarget, "foo.target")
+	_, _, err = fs.StoreMsg("foo.schedule", hdr, nil, 0)
+	require_NoError(t, err)
+
+	// We should have published a scheduled message.
+	im := require_ChanRead(t, ch, time.Second*5)
+	require_Equal(t, im.subj, "foo.target")
+	require_Equal(t, bytesToString(getHeader(JSScheduler, im.hdr)), "foo.schedule")
+	require_Equal(t, bytesToString(getHeader(JSScheduleNext, im.hdr)), JSScheduleNextPurge)
 }
 
 ///////////////////////////////////////////////////////////////////////////

@@ -1,4 +1,4 @@
-// Copyright 2018-2024 The NATS Authors
+// Copyright 2018-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -40,6 +40,7 @@ import (
 
 func init() {
 	gatewayConnectDelay = 15 * time.Millisecond
+	gatewayConnectMaxDelay = 15 * time.Millisecond
 	gatewayReconnectDelay = 15 * time.Millisecond
 }
 
@@ -1443,6 +1444,62 @@ func TestGatewayImplicitReconnectHonorConnectRetries(t *testing.T) {
 	waitForInboundGateways(t, sb, 1, 2*time.Second)
 	waitForOutboundGateways(t, sc, 1, 2*time.Second)
 	waitForInboundGateways(t, sc, 1, 2*time.Second)
+}
+
+func TestGatewayReconnectExponentialBackoff(t *testing.T) {
+	oGatewayConnectDelay := gatewayConnectDelay
+	oGatewayConnectMaxDelay := gatewayConnectMaxDelay
+	gatewayConnectDelay = 500 * time.Millisecond
+	gatewayConnectMaxDelay = 2 * time.Second
+	defer func() {
+		gatewayConnectDelay = oGatewayConnectDelay
+		gatewayConnectMaxDelay = oGatewayConnectMaxDelay
+	}()
+
+	ob := testDefaultOptionsForGateway("B")
+	ob.ReconnectErrorReports = 1
+	ob.Gateway.ConnectRetries = 3
+	ob.Gateway.ConnectBackoff = true
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	l := &gwReconnAttemptLogger{errCh: make(chan string, 3)}
+	sb.SetLogger(l, true, false)
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	// Wait for the proper connections
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	// Remove initial delay before reconnect, and allow for some skew.
+	now := time.Now().Add(gatewayReconnectDelay).Add(-100 * time.Millisecond)
+	var delay time.Duration
+
+	// B will try to reconnect to A 3 times (we stop after attempts > ConnectRetries)
+	sa.Shutdown()
+	for i := 0; i < ob.Gateway.ConnectRetries+1; i++ {
+		select {
+		case <-l.errCh:
+			if since := time.Since(now); since < delay {
+				t.Fatalf("Expected delay to take %v, took %v", delay, since)
+			}
+			if delay == 0 {
+				delay = gatewayConnectDelay
+			} else {
+				delay *= 2
+			}
+			if delay > gatewayConnectMaxDelay {
+				delay = gatewayConnectMaxDelay
+			}
+		case <-time.After(gatewayConnectMaxDelay + time.Second):
+			t.Fatal("Did not attempt to reconnect")
+		}
+	}
 }
 
 func TestGatewayURLsFromClusterSentInINFO(t *testing.T) {
@@ -6456,6 +6513,65 @@ func TestGatewayTLSConfigReloadForRemote(t *testing.T) {
 	waitForOutboundGateways(t, srvA, 1, time.Second)
 	waitForInboundGateways(t, srvB, 1, time.Second)
 	waitForOutboundGateways(t, srvB, 1, time.Second)
+}
+
+func TestGatewayTLSConfigReloadForImplicitRemote(t *testing.T) {
+	SetGatewaysSolicitDelay(5 * time.Millisecond)
+	defer ResetGatewaysSolicitDelay()
+
+	template := `
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "A"
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: "../test/configs/certs/srva-cert.pem"
+				key_file:  "../test/configs/certs/srva-key.pem"
+				%s
+				verify: true
+			}
+		}
+	`
+	confA := createConfFile(t, fmt.Appendf(nil, template, `ca_file:   "../test/configs/certs/ca.pem"`))
+	srvA, optsA := RunServerWithConfig(confA)
+	defer srvA.Shutdown()
+
+	optsB := testGatewayOptionsFromToWithTLS(t, "B", "A", []string{fmt.Sprintf("nats://127.0.0.1:%d", optsA.Gateway.Port)})
+	srvB := runGatewayServer(optsB)
+	defer srvB.Shutdown()
+
+	waitForInboundGateways(t, srvA, 1, time.Second)
+	waitForOutboundGateways(t, srvA, 1, time.Second)
+	waitForInboundGateways(t, srvB, 1, time.Second)
+	waitForOutboundGateways(t, srvB, 1, time.Second)
+
+	// We will verify that the config reload of the tls{} block is applied to
+	// the implicit remote (from A to B) by removing the ca_file.
+	reloadUpdateConfig(t, srvA, confA, fmt.Sprintf(template, ""))
+
+	// Get the remote from A to B
+	cfg := srvA.getRemoteGateway("B")
+	require_NotNil(t, cfg)
+	cfg.Lock()
+	tc := cfg.TLSConfig
+	cfg.Unlock()
+	require_NotNil(t, tc)
+	// The CA should have been removed.
+	require_True(t, tc.ClientCAs == nil)
+
+	// Reset the connection attempts, since we are going to close the connection
+	// from A to B and make sure that connection keeps failing.
+	cfg.resetConnAttempts()
+
+	// Get the outbound connection and close it.
+	c := srvA.getOutboundGatewayConnection("B")
+	require_NotNil(t, c)
+	c.mu.Lock()
+	c.nc.Close()
+	c.mu.Unlock()
+
+	// Verify that we fail to connect from A to B now.
+	waitForGatewayFailedConnect(t, srvA, "B", true, time.Second)
 }
 
 func TestGatewayAuthDiscovered(t *testing.T) {

@@ -1,4 +1,4 @@
-// Copyright 2019-2024 The NATS Authors
+// Copyright 2019-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -2755,7 +2755,7 @@ func TestLeafNodeServiceImportLikeNGS(t *testing.T) {
 
 	// Now create a leafnode server on B.
 	opts = cb.opts[1]
-	sl, slOpts := runSolicitLeafServer(opts)
+	sl, slOpts := runSolicitLeafServerToURL(fmt.Sprintf("nats-leaf://dlc:pass@%s:%d", opts.LeafNode.Host, opts.LeafNode.Port))
 	defer sl.Shutdown()
 
 	checkLeafNodeConnected(t, sl)
@@ -2952,7 +2952,8 @@ func TestLeafNodeDistributedQueueAcrossGWs(t *testing.T) {
 	createLNS := func(c *cluster) (*server.Server, *server.Options) {
 		t.Helper()
 		// Pick one at random.
-		s, opts := runSolicitLeafServer(c.opts[rand.Intn(len(c.servers))])
+		copts := c.opts[rand.Intn(len(c.servers))]
+		s, opts := runSolicitLeafServerToURL(fmt.Sprintf("nats-leaf://dlc:pass@%s:%d", copts.LeafNode.Host, copts.LeafNode.Port))
 		checkLeafNodeConnected(t, s)
 		return s, opts
 	}
@@ -3032,7 +3033,7 @@ func TestLeafNodeDistributedQueueEvenly(t *testing.T) {
 		t.Helper()
 		// Pick one at random.
 		copts := c.opts[rand.Intn(len(c.servers))]
-		s, opts := runSolicitLeafServer(copts)
+		s, opts := runSolicitLeafServerToURL(fmt.Sprintf("nats-leaf://dlc:pass@%s:%d", copts.LeafNode.Host, copts.LeafNode.Port))
 		checkLeafNodeConnected(t, s)
 		return s, opts
 	}
@@ -3753,7 +3754,11 @@ func TestServiceExportWithLeafnodeRestart(t *testing.T) {
 		listen: 127.0.0.1:-1
 		leafnodes {
 			listen: "127.0.0.1:-1"
-			authorization { account:"EXTERNAL" }
+			authorization {
+				account:"EXTERNAL"
+				user: ln
+				password: pass
+			}
 		}
 
 		accounts: {
@@ -3798,7 +3803,7 @@ func TestServiceExportWithLeafnodeRestart(t *testing.T) {
 			listen: "127.0.0.1:-1"
 			remotes = [
 			{
-				url:"nats://127.0.0.1:%d"
+				url:"nats://ln:pass@127.0.0.1:%d"
 				account:"EXTERNAL_GOOD"
 			}
 			]
@@ -4449,4 +4454,56 @@ func TestLeafNodeClusterNameWithSpacesRejected(t *testing.T) {
 	leafSend("INFO {\"cluster\":\"my cluster\"}\r\n")
 	leafExpect(errRe)
 	expectDisconnect(t, lc)
+}
+
+func TestLeafNodeConnectInfo(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		sys    string
+		hasSys bool
+	}{
+		{"with explicit system account", "system_account: SYS", true},
+		{"without explicit system account", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conf := createConfFile(t, []byte(fmt.Sprintf(`
+				port: -1
+				%s
+				accounts {
+					SYS: { users: [{ user: sys, password: pwd}] }
+					A:   { users: [{ user: a, password: pwd}] }
+					B:   { users: [{ user: b, password: pwd}] }
+				}
+				leafnodes {
+					port: -1
+				}
+			`, test.sys)))
+			hub, oHub := RunServerWithConfig(conf)
+			defer hub.Shutdown()
+
+			checkInfoOnConnect := func(user, acc string, isSys bool) {
+				t.Helper()
+				lc := createLeafConn(t, oHub.LeafNode.Host, oHub.LeafNode.Port)
+				defer lc.Close()
+
+				checkInfoMsg(t, lc)
+
+				sendProto(t, lc, fmt.Sprintf("CONNECT {\"user\":%q,\"pass\":\"pwd\"}\r\n", user))
+				info := checkInfoMsg(t, lc)
+				if !info.ConnectInfo {
+					t.Fatal("Expected ConnectInfo to be true")
+				}
+				if an := info.RemoteAccount; an != acc {
+					t.Fatalf("Expected account %q, got %q", acc, info.RemoteAccount)
+				}
+				if ais := info.IsSystemAccount; ais != isSys {
+					t.Fatalf("Expected IsSystemAccount to be %v, got %v", isSys, ais)
+				}
+				checkLeafNodeConnected(t, hub)
+			}
+			checkInfoOnConnect("a", "A", false)
+			checkInfoOnConnect("sys", "SYS", test.hasSys)
+			checkInfoOnConnect("b", "B", false)
+		})
+	}
 }

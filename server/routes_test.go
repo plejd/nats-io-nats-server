@@ -1,4 +1,4 @@
-// Copyright 2013-2024 The NATS Authors
+// Copyright 2013-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -42,6 +42,7 @@ import (
 
 func init() {
 	routeConnectDelay = 15 * time.Millisecond
+	routeConnectMaxDelay = 15 * time.Millisecond
 }
 
 func checkNumRoutes(t *testing.T, s *Server, expected int) {
@@ -104,9 +105,10 @@ func TestRouteConfig(t *testing.T) {
 			AuthTimeout:    1.0,
 			NoAdvertise:    true,
 			ConnectRetries: 2,
+			ConnectBackoff: true,
 		},
 		PidFile:          "/tmp/nats-server/nats_cluster_test.pid",
-		configDigest:     "sha256:1a95b87d99ff3950ff3eb220ef6ffb5387c95fa606ed6976023ade266329c7b5",
+		configDigest:     "sha256:b2f6d54063e43a85f5a09d198204f044bc154f9f9ccfb84e47d5762091aec487",
 		authBlockDefined: true,
 	}
 
@@ -326,10 +328,12 @@ func checkClusterFormed(t testing.TB, servers ...*Server) {
 				if a == b {
 					continue
 				}
-				if b.getOpts().Cluster.PoolSize < 0 {
+				bo := b.getOpts()
+				if ps := bo.Cluster.PoolSize; ps < 0 {
 					total++
 				} else {
-					total += nr
+					bps := ps + len(bo.Cluster.PinnedAccounts)
+					total += max(nr, bps)
 				}
 			}
 			enr = append(enr, total)
@@ -1748,6 +1752,64 @@ func TestRouteSolicitedReconnectsEvenIfImplicit(t *testing.T) {
 		t.Fatalf("Unexpected attempt to reconnect: %s", msg)
 	case <-time.After(50 * time.Millisecond):
 		// OK
+	}
+}
+
+func TestRouteReconnectExponentialBackoff(t *testing.T) {
+	oRouteConnectDelay := routeConnectDelay
+	oRouteConnectMaxDelay := routeConnectMaxDelay
+	routeConnectDelay = 500 * time.Millisecond
+	routeConnectMaxDelay = 2 * time.Second
+	defer func() {
+		routeConnectDelay = oRouteConnectDelay
+		routeConnectMaxDelay = oRouteConnectMaxDelay
+	}()
+
+	o1 := DefaultOptions()
+	o1.ServerName = "A"
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.ServerName = "B"
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
+	o2.Cluster.ConnectRetries = 3
+	o2.Cluster.ConnectBackoff = true
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	// Now shutdown server 1 and make sure that s2 stops trying to reconnect to s1 at one point
+	l := &testRouteReconnectLogger{ch: make(chan string, 10)}
+	s2.SetLogger(l, true, false)
+
+	// Remove initial delay before reconnect, and allow for some skew.
+	now := time.Now().Add(DEFAULT_ROUTE_RECONNECT).Add(-100 * time.Millisecond)
+	var delay time.Duration
+
+	// S2 should retry ConnectRetries+1 times and then stop
+	// Take into account default route pool size and system account dedicated route
+	s1.Shutdown()
+	for i := 0; i < (DEFAULT_ROUTE_POOL_SIZE+1)*(o2.Cluster.ConnectRetries+1); i++ {
+		select {
+		case <-l.ch:
+			if since := time.Since(now); since < delay {
+				t.Fatalf("Expected delay to take %v, took %v", delay, since)
+			}
+			if i > 0 && (i+1)%(DEFAULT_ROUTE_POOL_SIZE+1) == 0 {
+				if delay == 0 {
+					delay = routeConnectDelay
+				} else {
+					delay *= 2
+				}
+				if delay > routeConnectMaxDelay {
+					delay = routeConnectMaxDelay
+				}
+			}
+		case <-time.After(routeConnectMaxDelay + time.Second):
+			t.Fatal("Did not attempt to reconnect")
+		}
 	}
 }
 
@@ -3678,6 +3740,62 @@ func TestRoutePoolWithOlderServerConnectAndReconnect(t *testing.T) {
 	checkClusterFormed(t, s1, s2)
 	// And again, make sure there is no repeat-connect
 	checkRepeatConnect()
+}
+
+func TestRoutePoolBadAuthNoRunawayCreateRoute(t *testing.T) {
+	conf1 := createConfFile(t, []byte(`
+		server_name: "S1"
+		listen: "127.0.0.1:-1"
+		cluster {
+			name: "local"
+			listen: "127.0.0.1:-1"
+			pool_size: 4
+			authorization {
+				user: "correct"
+				password: "correct"
+				timeout: 5
+			}
+		}
+	`))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+
+	l := &captureErrorLogger{errCh: make(chan string, 100)}
+	s1.SetLogger(l, false, false)
+
+	tmpl := `
+		server_name: "S2"
+		listen: "127.0.0.1:-1"
+		cluster {
+			name: "local"
+			listen: "127.0.0.1:-1"
+			pool_size: 5
+			routes: ["nats://%s@127.0.0.1:%d"]
+		}
+	`
+	conf2 := createConfFile(t, fmt.Appendf(nil, tmpl, "incorrect:incorrect", o1.Cluster.Port))
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	deadline := time.Now().Add(2 * time.Second)
+	var errors int
+	for time.Now().Before(deadline) {
+		select {
+		case <-l.errCh:
+			errors++
+		default:
+		}
+	}
+	// We should not get that many errors now. In the past, we would get more
+	// than 200 for the 2 sec wait.
+	if errors > 10 {
+		t.Fatalf("Unexpected number of errors: %v", errors)
+	}
+
+	// Reload with proper credentials.
+	reloadUpdateConfig(t, s2, conf2, fmt.Sprintf(tmpl, "correct:correct", o1.Cluster.Port))
+	// Ensure we can connect.
+	checkClusterFormed(t, s1, s2)
 }
 
 func TestRouteCompressionOptions(t *testing.T) {

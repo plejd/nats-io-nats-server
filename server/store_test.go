@@ -1,4 +1,4 @@
-// Copyright 2012-2024 The NATS Authors
+// Copyright 2012-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,13 @@ package server
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
+
+	"github.com/nats-io/nats-server/v2/server/gsl"
 )
 
 func testAllStoreAllPermutations(t *testing.T, compressionAndEncryption bool, cfg StreamConfig, fn func(t *testing.T, fs StreamStore)) {
@@ -61,8 +67,8 @@ func TestStoreMsgLoadNextMsgMulti(t *testing.T) {
 
 			var smv StoreMsg
 			// Do multi load next with 1 wc entry.
-			sl := NewSublistWithCache()
-			sl.Insert(&subscription{subject: []byte("foo.>")})
+			sl := gsl.NewSublist[struct{}]()
+			sl.Insert("foo.>", struct{}{})
 			for i, seq := 0, uint64(1); i < 1000; i++ {
 				sm, nseq, err := fs.LoadNextMsgMulti(sl, seq, &smv)
 				require_NoError(t, err)
@@ -72,10 +78,10 @@ func TestStoreMsgLoadNextMsgMulti(t *testing.T) {
 			}
 
 			// Now do multi load next with 1000 literal subjects.
-			sl = NewSublistWithCache()
+			sl = gsl.NewSublist[struct{}]()
 			for i := 0; i < 1000; i++ {
 				subj := fmt.Sprintf("foo.%d", i)
-				sl.Insert(&subscription{subject: []byte(subj)})
+				sl.Insert(subj, struct{}{})
 			}
 			for i, seq := 0, uint64(1); i < 1000; i++ {
 				sm, nseq, err := fs.LoadNextMsgMulti(sl, seq, &smv)
@@ -86,10 +92,10 @@ func TestStoreMsgLoadNextMsgMulti(t *testing.T) {
 			}
 
 			// Check that we can pull out 3 individuals.
-			sl = NewSublistWithCache()
-			sl.Insert(&subscription{subject: []byte("foo.2")})
-			sl.Insert(&subscription{subject: []byte("foo.222")})
-			sl.Insert(&subscription{subject: []byte("foo.999")})
+			sl = gsl.NewSublist[struct{}]()
+			sl.Insert("foo.2", struct{}{})
+			sl.Insert("foo.222", struct{}{})
+			sl.Insert("foo.999", struct{}{})
 			sm, seq, err := fs.LoadNextMsgMulti(sl, 1, &smv)
 			require_NoError(t, err)
 			require_Equal(t, sm.subj, "foo.2")
@@ -534,4 +540,182 @@ func TestStorePurgeExZero(t *testing.T) {
 			require_Equal(t, ss.LastSeq, 0)
 		},
 	)
+}
+
+func TestStoreUpdateConfigTTLState(t *testing.T) {
+	config := func() StreamConfig {
+		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}}
+	}
+	testAllStoreAllPermutations(
+		t, false, config(),
+		func(t *testing.T, fs StreamStore) {
+			cfg := config()
+			switch fs.(type) {
+			case *fileStore:
+				cfg.Storage = FileStorage
+			case *memStore:
+				cfg.Storage = MemoryStorage
+			}
+
+			// TTLs disabled at this point so this message should survive.
+			seq, _, err := fs.StoreMsg("foo", nil, nil, 1)
+			require_NoError(t, err)
+			time.Sleep(2 * time.Second)
+			_, err = fs.LoadMsg(seq, nil)
+			require_NoError(t, err)
+
+			// Now enable TTLs.
+			cfg.AllowMsgTTL = true
+			require_NoError(t, fs.UpdateConfig(&cfg))
+
+			// TTLs enabled at this point so this message should be cleaned up.
+			seq, _, err = fs.StoreMsg("foo", nil, nil, 1)
+			require_NoError(t, err)
+			time.Sleep(2 * time.Second)
+			_, err = fs.LoadMsg(seq, nil)
+			require_Error(t, err)
+
+			// Now disable TTLs again.
+			cfg.AllowMsgTTL = false
+			require_NoError(t, fs.UpdateConfig(&cfg))
+
+			// TTLs disabled again so this message should survive.
+			seq, _, err = fs.StoreMsg("foo", nil, nil, 1)
+			require_NoError(t, err)
+			time.Sleep(2 * time.Second)
+			_, err = fs.LoadMsg(seq, nil)
+			require_NoError(t, err)
+		},
+	)
+}
+
+func TestStoreStreamInteriorDeleteAccounting(t *testing.T) {
+	tests := []struct {
+		title  string
+		action func(s StreamStore, lseq uint64)
+	}{
+		{
+			title: "TruncateWithRemove",
+			action: func(s StreamStore, lseq uint64) {
+				seq, _, err := s.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				require_Equal(t, seq, lseq)
+				removed, err := s.RemoveMsg(lseq)
+				require_NoError(t, err)
+				require_True(t, removed)
+				require_NoError(t, s.Truncate(lseq))
+			},
+		},
+		{
+			title: "TruncateWithErase",
+			action: func(s StreamStore, lseq uint64) {
+				seq, _, err := s.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				require_Equal(t, seq, lseq)
+				removed, err := s.EraseMsg(lseq)
+				require_NoError(t, err)
+				require_True(t, removed)
+				require_NoError(t, s.Truncate(lseq))
+			},
+		},
+		{
+			title: "TruncateWithTombstone",
+			action: func(s StreamStore, lseq uint64) {
+				seq, _, err := s.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				require_Equal(t, seq, lseq)
+				if fs, ok := s.(*fileStore); ok {
+					removed, err := fs.removeMsg(lseq, false, false, true)
+					require_NoError(t, err)
+					require_True(t, removed)
+				} else {
+					removed, err := s.RemoveMsg(lseq)
+					require_NoError(t, err)
+					require_True(t, removed)
+				}
+				require_NoError(t, s.Truncate(lseq))
+			},
+		},
+		{
+			title: "SkipMsg",
+			action: func(s StreamStore, lseq uint64) {
+				s.SkipMsg()
+			},
+		},
+		{
+			title: "SkipMsgs",
+			action: func(s StreamStore, lseq uint64) {
+				require_NoError(t, s.SkipMsgs(lseq, 1))
+			},
+		},
+	}
+	for _, empty := range []bool{false, true} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("Empty=%v/%s", empty, test.title), func(t *testing.T) {
+				cfg := StreamConfig{Name: "zzz", Subjects: []string{"foo"}}
+				testAllStoreAllPermutations(t, true, cfg, func(t *testing.T, s StreamStore) {
+					var err error
+					var lseq uint64
+					if !empty {
+						lseq, _, err = s.StoreMsg("foo", nil, nil, 0)
+						require_NoError(t, err)
+						require_Equal(t, lseq, 1)
+					}
+					lseq++
+
+					test.action(s, lseq)
+
+					// Confirm state as baseline.
+					before := s.State()
+					if empty {
+						require_Equal(t, before.Msgs, 0)
+						require_Equal(t, before.FirstSeq, 2)
+						require_Equal(t, before.LastSeq, 1)
+					} else {
+						require_Equal(t, before.Msgs, 1)
+						require_Equal(t, before.FirstSeq, 1)
+						require_Equal(t, before.LastSeq, 2)
+					}
+
+					var fs *fileStore
+					var ok bool
+					if fs, ok = s.(*fileStore); !ok {
+						return
+					}
+					cfg.Storage = FileStorage
+					fcfg := fs.fcfg
+					created := time.Time{}
+
+					// Restart should equal state.
+					require_NoError(t, fs.Stop())
+					fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+					require_NoError(t, err)
+					defer fs.Stop()
+
+					if state := fs.State(); !reflect.DeepEqual(state, before) {
+						t.Fatalf("Expected state of:\n%+v, got:\n%+v", before, state)
+					}
+
+					// Stop and remove stream state file.
+					require_NoError(t, fs.Stop())
+					require_NoError(t, os.Remove(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)))
+
+					// Recovering based on blocks should result in the same state.
+					fs, err = newFileStoreWithCreated(fcfg, cfg, created, prf(&fcfg), nil)
+					require_NoError(t, err)
+					defer fs.Stop()
+
+					if state := fs.State(); !reflect.DeepEqual(state, before) {
+						t.Fatalf("Expected state of:\n%+v, got:\n%+v", before, state)
+					}
+
+					// Rebuilding state must also result in the same state.
+					fs.rebuildState(nil)
+					if state := fs.State(); !reflect.DeepEqual(state, before) {
+						t.Fatalf("Expected state of:\n%+v, got:\n%+v", before, state)
+					}
+				})
+			})
+		}
+	}
 }

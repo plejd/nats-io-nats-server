@@ -5,15 +5,17 @@ on:
       - v*
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
     name: GitHub Release
     runs-on: ${{ vars.GHA_WORKER_RELEASE || 'ubuntu-latest' }}
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -31,15 +33,15 @@ jobs:
 
       - name: Install cosign
         # Use commit hash here to avoid a re-tagging attack, as this is a third-party action
-        # Commit 3454372f43399081ed03b604cb2d021dabca52bb = tag v3.8.2
-        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb
+        # Commit d58896d6a1865668819e1d91763c7751a165e159 = tag v3.9.2
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
 
       - name: Install syft
         # Use commit hash here to avoid a re-tagging attack, as this is a third-party action
-        # Commit 9f7302141466aa6482940f15371237e9d9f4c34a = tag v0.19.0
-        uses: anchore/sbom-action/download-syft@9f7302141466aa6482940f15371237e9d9f4c34a
+        # Commit da167eac915b4e86f08b264dbdbc867b61be6f0c = tag v0.20.5
+        uses: anchore/sbom-action/download-syft@da167eac915b4e86f08b264dbdbc867b61be6f0c
         with:
-          syft-version: "v1.20.0"
+          syft-version: "v1.27.1"
 
       - name: Create release
         uses: goreleaser/goreleaser-action@v6

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"testing"
@@ -28,6 +29,19 @@ import (
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats.go"
 )
+
+func TestGetAndSupportsRequiredApiLevel(t *testing.T) {
+	require_Equal(t, getRequiredApiLevel(nil), _EMPTY_)
+	require_Equal(t, getRequiredApiLevel(map[string]string{}), _EMPTY_)
+	require_Equal(t, getRequiredApiLevel(map[string]string{JSRequiredLevelMetadataKey: "1"}), "1")
+	require_Equal(t, getRequiredApiLevel(map[string]string{JSRequiredLevelMetadataKey: "text"}), "text")
+
+	require_True(t, supportsRequiredApiLevel(nil))
+	require_True(t, supportsRequiredApiLevel(map[string]string{}))
+	require_True(t, supportsRequiredApiLevel(map[string]string{JSRequiredLevelMetadataKey: "1"}))
+	require_True(t, supportsRequiredApiLevel(map[string]string{JSRequiredLevelMetadataKey: strconv.Itoa(JSApiLevel)}))
+	require_False(t, supportsRequiredApiLevel(map[string]string{JSRequiredLevelMetadataKey: "text"}))
+}
 
 func metadataAtLevel(featureLevel string) map[string]string {
 	return map[string]string{
@@ -67,10 +81,36 @@ func TestJetStreamSetStaticStreamMetadata(t *testing.T) {
 			cfg:              &StreamConfig{AllowMsgTTL: true},
 			expectedMetadata: metadataAtLevel("1"),
 		},
+		{
+			desc:             "SubjectDeleteMarkerTTL",
+			cfg:              &StreamConfig{SubjectDeleteMarkerTTL: time.Second},
+			expectedMetadata: metadataAtLevel("1"),
+		},
+		{
+			desc:             "AllowMsgCounter",
+			cfg:              &StreamConfig{AllowMsgCounter: true},
+			expectedMetadata: metadataAtLevel("2"),
+		},
+		{
+			desc:             "AllowAtomicPublish",
+			cfg:              &StreamConfig{AllowAtomicPublish: true},
+			expectedMetadata: metadataAtLevel("2"),
+		},
+		{
+			desc:             "AllowMsgSchedules",
+			cfg:              &StreamConfig{AllowMsgSchedules: true},
+			expectedMetadata: metadataAtLevel("2"),
+		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
 			setStaticStreamMetadata(test.cfg)
-			require_Equal(t, test.cfg.Metadata[JSRequiredLevelMetadataKey], test.expectedMetadata[JSRequiredLevelMetadataKey])
+			level := test.cfg.Metadata[JSRequiredLevelMetadataKey]
+			require_Equal(t, level, test.expectedMetadata[JSRequiredLevelMetadataKey])
+
+			// Ensure we up the server API level if we introduced a feature that requires it.
+			l, err := strconv.Atoi(level)
+			require_NoError(t, err)
+			require_True(t, l <= JSApiLevel)
 		})
 	}
 }
@@ -206,7 +246,13 @@ func TestJetStreamSetStaticConsumerMetadata(t *testing.T) {
 	} {
 		t.Run(test.desc, func(t *testing.T) {
 			setStaticConsumerMetadata(test.cfg)
-			require_Equal(t, test.cfg.Metadata[JSRequiredLevelMetadataKey], test.expectedMetadata[JSRequiredLevelMetadataKey])
+			level := test.cfg.Metadata[JSRequiredLevelMetadataKey]
+			require_Equal(t, level, test.expectedMetadata[JSRequiredLevelMetadataKey])
+
+			// Ensure we up the server API level if we introduced a feature that requires it.
+			l, err := strconv.Atoi(level)
+			require_NoError(t, err)
+			require_True(t, l <= JSApiLevel)
 		})
 	}
 }
@@ -585,4 +631,81 @@ func restoreEmptyStream(t *testing.T, nc *nats.Conn, replicas int) {
 	err = json.Unmarshal(msg.Data, &cresp)
 	require_NoError(t, err)
 	require_True(t, reflect.DeepEqual(cresp.Config.Metadata, expectedMetadata))
+}
+
+func TestJetStreamApiErrorOnRequiredApiLevel(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	var subs []*subscription
+	s.getJetStream().apiSubs.All(&subs)
+	require_True(t, len(subs) > 0)
+	for _, sub := range subs {
+		apiSubject := string(sub.subject)
+		t.Run(apiSubject, func(t *testing.T) {
+			req := nats.NewMsg(apiSubject)
+			req.Header.Set("Nats-Required-Api-Level", strconv.Itoa(math.MaxInt))
+			msg, err := nc.RequestMsg(req, time.Second)
+			require_NoError(t, err)
+
+			var resp ApiResponse
+			require_NoError(t, json.Unmarshal(msg.Data, &resp))
+			require_True(t, resp.Error != nil)
+			require_Error(t, resp.Error, NewJSRequiredApiLevelError())
+		})
+	}
+}
+
+func TestJetStreamApiErrorOnRequiredApiLevelDirectGet(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	req := nats.NewMsg(fmt.Sprintf(JSDirectMsgGetT, "TEST"))
+	req.Header.Set("Nats-Required-Api-Level", strconv.Itoa(math.MaxInt))
+	msg, err := nc.RequestMsg(req, time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get("Status"), "412")
+	require_Equal(t, msg.Header.Get("Description"), "Required Api Level")
+
+	req = nats.NewMsg(fmt.Sprintf(JSDirectGetLastBySubjectT, "TEST", "foo"))
+	req.Header.Set("Nats-Required-Api-Level", strconv.Itoa(math.MaxInt))
+	msg, err = nc.RequestMsg(req, time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get("Status"), "412")
+	require_Equal(t, msg.Header.Get("Description"), "Required Api Level")
+}
+
+func TestJetStreamApiErrorOnRequiredApiLevelPullConsumerNextMsg(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:        "TEST",
+		Subjects:    []string{"foo"},
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER"})
+	require_NoError(t, err)
+
+	req := nats.NewMsg(fmt.Sprintf(JSApiRequestNextT, "TEST", "CONSUMER"))
+	req.Header.Set("Nats-Required-Api-Level", strconv.Itoa(math.MaxInt))
+	msg, err := nc.RequestMsg(req, time.Second)
+	require_NoError(t, err)
+	require_Equal(t, msg.Header.Get("Status"), "412")
+	require_Equal(t, msg.Header.Get("Description"), "Required Api Level")
 }

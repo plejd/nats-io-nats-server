@@ -1,6 +1,9 @@
 name: MQTT External Tests
 on: [pull_request]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     env:
@@ -9,7 +12,7 @@ jobs:
     runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: src/github.com/nats-io/nats-server
 

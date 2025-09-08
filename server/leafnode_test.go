@@ -630,9 +630,9 @@ func TestLeafNodeBasicAuthSingleton(t *testing.T) {
 		lnURLCreds string
 		shouldFail bool
 	}{
-		{"no user creds required and no user so binds to ACC1", "", "", false},
-		{"no user creds required and pick user2 associated to ACC2", "", "user2:user2@", false},
-		{"no user creds required and unknown user should fail", "", "unknown:user@", true},
+		{"user creds required and no user so fails", "", "", true},
+		{"user creds required and pick user2 associated to ACC2", "", "user2:user2@", false},
+		{"user creds required and unknown user should fail", "", "unknown:user@", true},
 		{"user creds required so binds to ACC1", "user: \"ln\"\npass: \"pwd\"", "ln:pwd@", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -9712,30 +9712,48 @@ func TestLeafNodeDupeDeliveryQueueSubAndPlainSub(t *testing.T) {
 	// Create plain subscriber on server B attached to system-b account.
 	ncB := natsConnect(t, srvB.ClientURL(), nats.UserInfo("sb", "sb"))
 	defer ncB.Close()
-	sub, err := ncB.SubscribeSync("*.system-a.events.>")
-	require_NoError(t, err)
-	// Create a new sub that has a queue group as well.
-	subq, err := ncB.QueueSubscribeSync("*.system-a.events.objectnotfound", "SYSB")
-	require_NoError(t, err)
-	ncB.Flush()
+	sub := natsSubSync(t, ncB, "*.system-a.events.>")
+	subq := natsQueueSubSync(t, ncB, "*.system-a.events.objectnotfound", "SBQ")
+	natsFlush(t, ncB)
+
+	// Create a subscription on SA1 (we will send from SA0). We want to make sure that
+	// when subscription on B is removed, this does not affect the subject interest
+	// in SA0 on behalf of SA1.
+	ncSAA1 := natsConnect(t, srvA1.ClientURL(), nats.UserInfo("sa", "sa"))
+	defer ncSAA1.Close()
+	sub2 := natsSubSync(t, ncSAA1, "*.system-a.events.>")
+	subq2 := natsQueueSubSync(t, ncSAA1, "*.system-a.events.objectnotfound", "SBQ")
+	natsFlush(t, ncSAA1)
+
 	time.Sleep(250 * time.Millisecond)
 
-	// Connect to cluster A
+	// Connect to cluster A on SA0.
 	ncA := natsConnect(t, srvA0.ClientURL(), nats.UserInfo("t", "t"))
 	defer ncA.Close()
 
-	err = ncA.Publish("system-a.events.objectnotfound", []byte("EventA"))
-	require_NoError(t, err)
-	ncA.Flush()
-	// Wait for them to be received.
+	natsPub(t, ncA, "system-a.events.objectnotfound", []byte("EventA"))
+	natsFlush(t, ncA)
+
+	natsNexMsg(t, sub, time.Second)
+	natsNexMsg(t, sub2, time.Second)
+	if _, err := subq.NextMsg(250 * time.Millisecond); err != nil {
+		natsNexMsg(t, subq2, time.Second)
+	}
+
+	// Unsubscribe the subscriptions from server B.
+	natsUnsub(t, sub)
+	natsUnsub(t, subq)
+	natsFlush(t, ncB)
+
+	// Wait for subject propagation.
 	time.Sleep(250 * time.Millisecond)
 
-	n, _, err := sub.Pending()
-	require_NoError(t, err)
-	require_Equal(t, n, 1)
-	n, _, err = subq.Pending()
-	require_NoError(t, err)
-	require_Equal(t, n, 1)
+	// Publish again, subscriptions on SA1 should receive it.
+	natsPub(t, ncA, "system-a.events.objectnotfound", []byte("EventA"))
+	natsFlush(t, ncA)
+
+	natsNexMsg(t, sub2, time.Second)
+	natsNexMsg(t, subq2, time.Second)
 }
 
 func TestLeafNodeServerKickClient(t *testing.T) {
@@ -9965,7 +9983,603 @@ func TestLeafNodePermissionWithLiteralSubjectAndQueueInterest(t *testing.T) {
 	ncHub := natsConnect(t, hub.ClientURL(), nats.UserInfo("user", "pwd"))
 	defer ncHub.Close()
 
-	resp, err := ncHub.Request("my.subject", []byte("hello"), time.Second)
-	require_NoError(t, err)
+	var resp *nats.Msg
+	var err error
+	checkFor(t, 5*time.Second, time.Second, func() error {
+		// Make sure we don't fail the test on the first "no responders", might
+		// take time for the sub to propagate.
+		resp, err = ncHub.Request("my.subject", []byte("hello"), time.Second)
+		return err
+	})
 	require_Equal(t, "OK", string(resp.Data))
+}
+
+func TestLeafNodePermissionWithGateways(t *testing.T) {
+	usConf := createConfFile(t, []byte(`
+		server_name: "US"
+		listen: "127.0.0.1:-1"
+		gateway {
+			name: "US"
+			listen: "127.0.0.1:-1"
+		}
+		accounts {
+			sys { users: [{user: sys, password: sys}] }
+			leaf { users: [{user: leaf, password: leaf}] }
+		}
+		system_account: sys
+	`))
+	us, ous := RunServerWithConfig(usConf)
+	defer us.Shutdown()
+
+	euConf := createConfFile(t, fmt.Appendf(nil, `
+		server_name: "EU"
+		listen: "127.0.0.1:-1"
+		gateway {
+			name: "EU"
+			listen: "127.0.0.1:-1"
+			gateways: [
+				{
+					name: "US"
+					urls: ["nats://127.0.0.1:%d"]
+				}
+			]
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+		accounts {
+			sys { users: [{user: sys, password: sys}] }
+			leaf {
+				users: [
+					{
+						user: leaf
+						password: leaf
+						permissions: {
+							publish: "bar"
+							subscribe: "foo"
+						}
+					}
+				]
+			}
+		}
+		system_account: sys
+		`, ous.Gateway.Port))
+	eu, oeu := RunServerWithConfig(euConf)
+	defer eu.Shutdown()
+
+	waitForOutboundGateways(t, us, 1, 2*time.Second)
+	waitForOutboundGateways(t, eu, 1, 2*time.Second)
+	waitForInboundGateways(t, us, 1, 2*time.Second)
+	waitForInboundGateways(t, eu, 1, 2*time.Second)
+
+	leafConf := createConfFile(t, fmt.Appendf(nil, `
+		server_name: "LEAF"
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			remotes: [
+				{ url: "nats://leaf:leaf@127.0.0.1:%d" }
+			]
+		}
+	`, oeu.LeafNode.Port))
+	leaf, _ := RunServerWithConfig(leafConf)
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, leaf)
+
+	// Run the service from EU leafnode.
+	ncEU := natsConnect(t, leaf.ClientURL())
+	defer ncEU.Close()
+	natsSub(t, ncEU, "foo", func(m *nats.Msg) {
+		m.Respond([]byte("response"))
+	})
+	natsFlush(t, ncEU)
+
+	// Wait for subject interest to propagate.
+	checkGWInterestOnlyModeInterestOn(t, us, "EU", "leaf", "foo")
+
+	// Connect to the US server
+	ncUS := natsConnect(t, us.ClientURL(), nats.UserInfo("leaf", "leaf"))
+	defer ncUS.Close()
+
+	// Create a subscription on "bar" and send request on "foo"
+	sub := natsSubSync(t, ncUS, "bar")
+	// Wait for subject to propagate so we know that EU server
+	// would know about the "bar" subscription.
+	checkGWInterestOnlyModeInterestOn(t, eu, "US", "leaf", "bar")
+	// Send the request and make sure we receive the reply.
+	natsPubReq(t, ncUS, "foo", "bar", []byte("request"))
+	reply := natsNexMsg(t, sub, time.Second)
+	if string(reply.Data) != "response" {
+		t.Fatalf("Invalid response: %q", reply.Data)
+	}
+	// Make sure that we don't blindly accept any reply because there
+	// is the routing protocol. So create a sub on "baz" that the leaf
+	// would not be allowed to reply to. We should not get the reply
+	// to our request.
+	sub2 := natsSubSync(t, ncUS, "baz")
+	checkGWInterestOnlyModeInterestOn(t, eu, "US", "leaf", "baz")
+	// Send the request. We should not get the message since the
+	// leaf server does not have permission to publish on "baz".
+	natsPubReq(t, ncUS, "foo", "baz", []byte("request2"))
+	if msg, err := sub2.NextMsg(250 * time.Millisecond); err == nil {
+		t.Fatalf("Should not have received the reply, got %q", msg.Data)
+	}
+}
+
+func TestLeafNodesDisableRemote(t *testing.T) {
+	hubConf := createConfFile(t, []byte(`
+		server_name: "HUB"
+		listen: "127.0.0.1:-1"
+		accounts {
+			leaf1 { users: [{user: leaf1, password: pwd}] }
+			leaf2 { users: [{user: leaf2, password: pwd}] }
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	hub, ohub := RunServerWithConfig(hubConf)
+	defer hub.Shutdown()
+
+	port := ohub.LeafNode.Port
+	leafTmpl := `
+		server_name: "LEAF"
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			reconnect_interval: "50ms"
+			remotes: [
+				{
+					url: "nats://leaf1:pwd@127.0.0.1:%d"
+					disabled: %v
+				}
+				{
+					url: "nats://leaf2:pwd@127.0.0.1:%d"
+				}
+			]
+		}
+	`
+	// Start with "disabled: true" to make sure that we don't solicit it
+	// when starting the server.
+	leafConf := createConfFile(t, fmt.Appendf(nil, leafTmpl, port, true, port))
+	leaf, _ := RunServerWithConfig(leafConf)
+	defer leaf.Shutdown()
+
+	// Wait for more than the reconnect interval to make sure that we don't
+	// reconnect the connection that should have been disabled.
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify that we have only 1 leaf
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	reconnectCh := make(chan struct{}, 2)
+	ncl1 := natsConnect(t, hub.ClientURL(), nats.UserInfo("leaf1", "pwd"),
+		nats.ReconnectWait(50*time.Millisecond),
+		nats.ReconnectJitter(time.Millisecond, time.Millisecond),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			reconnectCh <- struct{}{}
+		}))
+	defer ncl1.Close()
+	sub1 := natsSubSync(t, ncl1, "foo")
+	natsFlush(t, ncl1)
+
+	ncl2 := natsConnect(t, hub.ClientURL(), nats.UserInfo("leaf2", "pwd"),
+		nats.ReconnectWait(50*time.Millisecond),
+		nats.ReconnectJitter(time.Millisecond, time.Millisecond),
+		nats.ReconnectHandler(func(_ *nats.Conn) {
+			reconnectCh <- struct{}{}
+		}))
+	defer ncl2.Close()
+	sub2 := natsSubSync(t, ncl2, "foo")
+	natsFlush(t, ncl2)
+
+	checkSubInterest(t, leaf, globalAccountName, "foo", time.Second)
+
+	nc := natsConnect(t, leaf.ClientURL())
+	defer nc.Close()
+
+	natsPub(t, nc, "foo", []byte("hello"))
+	natsFlush(t, nc)
+
+	// We should not receive on leaf1
+	_, err := sub1.NextMsg(100 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	// But should receive on leaf2.
+	msg := natsNexMsg(t, sub2, time.Second)
+	require_Equal(t, string(msg.Data), "hello")
+
+	// Enable leaf1, which means set "disabled" to false.
+	reloadUpdateConfig(t, leaf, leafConf, fmt.Sprintf(leafTmpl, port, false, port))
+
+	// Check that we have 2 leaf node connections now.
+	checkLeafNodeConnectedCount(t, hub, 2)
+	checkLeafNodeConnectedCount(t, leaf, 2)
+
+	// Verify connectivity.
+	natsPub(t, nc, "foo", []byte("hello2"))
+
+	msg = natsNexMsg(t, sub1, time.Second)
+	require_Equal(t, string(msg.Data), "hello2")
+
+	msg = natsNexMsg(t, sub2, time.Second)
+	require_Equal(t, string(msg.Data), "hello2")
+
+	// Disable again.
+	reloadUpdateConfig(t, leaf, leafConf, fmt.Sprintf(leafTmpl, port, true, port))
+
+	// Wait for more than the reconnect interval to make sure that we don't
+	// reconnect the connection that should have been disabled.
+	time.Sleep(100 * time.Millisecond)
+	// Verify that we have only 1 leaf
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	// Now send a message again.
+	natsPub(t, nc, "foo", []byte("hello3"))
+	natsFlush(t, nc)
+	// We should not receive on leaf1
+	_, err = sub1.NextMsg(100 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	// We should still receive for leaf2
+	msg = natsNexMsg(t, sub2, time.Second)
+	require_Equal(t, string(msg.Data), "hello3")
+
+	// Enable again.
+	reloadUpdateConfig(t, leaf, leafConf, fmt.Sprintf(leafTmpl, port, false, port))
+
+	checkLeafNodeConnectedCount(t, hub, 2)
+	checkLeafNodeConnectedCount(t, leaf, 2)
+
+	// Now shutdown hub.
+	hub.Shutdown()
+
+	// Wait to be disconnected
+	checkLeafNodeConnectedCount(t, leaf, 0)
+
+	// Wait at least some reconnect interval.
+	time.Sleep(100 * time.Millisecond)
+
+	// Now disable leaf1 one more time to make sure we stop soliciting when we were
+	// not currently connected.
+	reloadUpdateConfig(t, leaf, leafConf, fmt.Sprintf(leafTmpl, port, true, port))
+
+	// Restart hub
+	hub = RunServer(ohub)
+	defer hub.Shutdown()
+
+	// Verify that we have only 1 leaf
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	// Wait for clients to reconnect
+	for range 2 {
+		select {
+		case <-reconnectCh:
+		case <-time.After(time.Second):
+			t.Fatal("Client failed to reconnect")
+		}
+	}
+
+	// Wait for subject propagation
+	checkSubInterest(t, leaf, globalAccountName, "foo", time.Second)
+
+	// Now send a message again.
+	natsPub(t, nc, "foo", []byte("hello4"))
+	natsFlush(t, nc)
+	// We should not receive on leaf1
+	_, err = sub1.NextMsg(100 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	// We should still receive for leaf2
+	msg = natsNexMsg(t, sub2, time.Second)
+	require_Equal(t, string(msg.Data), "hello4")
+}
+
+func TestLeafNodeIsolatedLeafSubjectPropagation(t *testing.T) {
+	for tname, isolated := range map[string]bool{
+		"Isolated": true,
+		"Normal":   false,
+	} {
+		t.Run(tname, func(t *testing.T) {
+			hubTmpl := `
+				port: -1
+				server_name: "%s"
+				accounts {
+					HA { users: [{user: HA, password: pwd}] }
+				}
+				leafnodes {
+					port: -1
+					isolate_leafnode_interest: %v
+				}
+			`
+			confH := createConfFile(t, []byte(fmt.Sprintf(hubTmpl, "H1", isolated)))
+			sh, oh := RunServerWithConfig(confH)
+			defer sh.Shutdown()
+
+			spokeTmpl := `
+				port: -1
+				server_name: "%s"
+				accounts {
+					A { users: [{user: A, password: pwd}] }
+				}
+				leafnodes {
+					remotes [
+						{
+							url: "nats://HA:pwd@127.0.0.1:%d"
+							local: "A"
+						}
+					]
+				}
+			`
+
+			confSP1 := createConfFile(t, []byte(fmt.Sprintf(spokeTmpl, "SP1", oh.LeafNode.Port)))
+			sp1, _ := RunServerWithConfig(confSP1)
+			defer sp1.Shutdown()
+
+			confSP2 := createConfFile(t, []byte(fmt.Sprintf(spokeTmpl, "SP2", oh.LeafNode.Port)))
+			sp2, _ := RunServerWithConfig(confSP2)
+			defer sp2.Shutdown()
+
+			checkLeafNodeConnectedCount(t, sh, 2)
+			checkLeafNodeConnectedCount(t, sp1, 1)
+			checkLeafNodeConnectedCount(t, sp2, 1)
+
+			nch := natsConnect(t, sh.ClientURL(), nats.UserInfo("HA", "pwd"))
+			nc1 := natsConnect(t, sp1.ClientURL(), nats.UserInfo("A", "pwd"))
+
+			// Create a north-south subscription on the hub that should be visible to both spokes.
+			nssub, err := nch.SubscribeSync("northsouth")
+			require_NoError(t, err)
+			checkSubInterest(t, sh, "HA", "northsouth", time.Second) // Visible to the hub.
+			checkSubInterest(t, sp1, "A", "northsouth", time.Second) // Visible to both spokes.
+			checkSubInterest(t, sp2, "A", "northsouth", time.Second) // Visible to both spokes.
+
+			// The spoke subscriptions should be visible to the hub in all cases, but only
+			// visible to other spokes if they are not isolated.
+			ewsub, err := nc1.SubscribeSync("eastwest")
+			require_NoError(t, err)
+			checkSubInterest(t, sh, "HA", "eastwest", time.Second) // Visible to the hub.
+			checkSubInterest(t, sp1, "A", "eastwest", time.Second) // Visible to the spoke with the sub.
+			if isolated {
+				checkSubNoInterest(t, sp2, "A", "eastwest", time.Second) // Not visible to the other spoke.
+			} else {
+				checkSubInterest(t, sp2, "A", "eastwest", time.Second) // Visible to the other spoke.
+			}
+			require_NoError(t, ewsub.Unsubscribe())
+			checkSubNoInterest(t, sh, "HA", "eastwest", time.Second)
+			checkSubNoInterest(t, sp1, "A", "eastwest", time.Second)
+			checkSubNoInterest(t, sp2, "A", "eastwest", time.Second)
+
+			// ... but a subscription from the hub should be visible to both.
+			require_NoError(t, nssub.Unsubscribe())
+			checkSubNoInterest(t, sh, "HA", "northsouth", time.Second)
+			checkSubNoInterest(t, sp1, "A", "northsouth", time.Second)
+			checkSubNoInterest(t, sp2, "A", "northsouth", time.Second)
+		})
+	}
+}
+
+func TestLeafNodeDaisyChainWithAccountImportExport(t *testing.T) {
+	hubConf := createConfFile(t, []byte(`
+		server_name: hub
+		listen: "127.0.0.1:-1"
+
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+		accounts {
+			SYS: {
+				users: [{ user: s, password: s}],
+			},
+			ODC: {
+				jetstream: enabled
+				users: [
+					{
+						user: u, password: u,
+						permissions: {
+							publish: {deny: ["local.>","hub2leaf.>"]}
+							subscribe: {deny: ["local.>","leaf2leaf.>"]}
+						}
+					}
+				]
+			}
+		}
+	`))
+	hub, ohub := RunServerWithConfig(hubConf)
+	defer hub.Shutdown()
+
+	storeDir := t.TempDir()
+	leafJSConf := createConfFile(t, fmt.Appendf(nil, `
+		server_name: leaf-js
+		listen: "127.0.0.1:-1"
+
+		jetstream {
+			store_dir="%s/leaf-js"
+			domain=leaf-js
+		}
+		accounts {
+			ODC: {
+				jetstream: enabled
+				users: [{ user: u, password: u}]
+			},
+		}
+		leafnodes {
+			remotes [
+				{
+					urls: ["leaf://u:u@127.0.0.1:%d"] # connects to hub
+					account: ODC
+				}
+			]
+		}
+	`, storeDir, ohub.LeafNode.Port))
+	leafJS, _ := RunServerWithConfig(leafJSConf)
+	defer leafJS.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leafJS)
+
+	otherConf := createConfFile(t, []byte(`
+		server_name: other
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	other, oother := RunServerWithConfig(otherConf)
+	defer other.Shutdown()
+
+	tmpl := `
+		server_name: %s
+		listen: "127.0.0.1:-1"
+
+		leafnodes {
+			listen: "127.0.0.1:-1"
+			remotes [
+				{
+					urls: ["leaf://u:u@127.0.0.1:%d"]
+					account: ODC_DEV
+				}
+				{
+					urls: ["leaf://127.0.0.1:%d"]
+					account: ODC_DEV
+				}
+			]
+		}
+		cluster {
+			name: "hubsh"
+			listen: "127.0.0.1:-1"
+			%s
+		}
+		accounts: {
+			ODC_DEV: {
+				users: [
+					{user: o, password: o}
+				]
+				imports: [
+					{service: {account: "SH1", subject: "$JS.leaf-sh.API.>"}}
+					{stream: {account: "SH1", subject: "sync.leaf-sh.jspush.>"}}
+				]
+				exports: [
+					{stream: ">"}
+					{service: ">", response_type: "Singleton"}
+				]
+			}
+			SH1: {
+				users: [
+					{user: s, password: s}
+				]
+				exports: [
+					{service: "$JS.leaf-sh.API.>", response_type: "Stream"}
+					{stream: "sync.leaf-sh.jspush.>"}
+				]
+			}
+		}
+	`
+	hubSh1Conf := createConfFile(t, fmt.Appendf(nil, tmpl, "hubsh1", ohub.LeafNode.Port, oother.LeafNode.Port, _EMPTY_))
+	hubSh1, ohubSh1 := RunServerWithConfig(hubSh1Conf)
+	defer hubSh1.Shutdown()
+
+	hubSh2Conf := createConfFile(t, fmt.Appendf(nil, tmpl, "hubsh2", ohub.LeafNode.Port, oother.LeafNode.Port,
+		fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", ohubSh1.Cluster.Port)))
+	hubSh2, ohubSh2 := RunServerWithConfig(hubSh2Conf)
+	defer hubSh2.Shutdown()
+
+	checkClusterFormed(t, hubSh1, hubSh2)
+
+	checkLeafNodeConnectedCount(t, hub, 3)
+	checkLeafNodeConnectedCount(t, hubSh1, 2)
+	checkLeafNodeConnectedCount(t, hubSh2, 2)
+
+	leafShConf := createConfFile(t, fmt.Appendf(nil, `
+		server_name: leafsh
+		listen: "127.0.0.1:-1"
+
+		jetstream {
+			store_dir="%s/leafsh"
+			domain=leaf-sh
+		}
+		accounts {
+			SH: {
+				jetstream: enabled
+				users: [{user: u, password: u}]
+			}
+		}
+		leafnodes {
+			remotes [
+				{
+					urls: ["leaf://s:s@127.0.0.1:%d"]
+					account: SH
+				}
+			]
+		}
+	`, storeDir, ohubSh2.LeafNode.Port))
+	leafSh, _ := RunServerWithConfig(leafShConf)
+	defer leafSh.Shutdown()
+
+	checkLeafNodeConnectedCount(t, hubSh2, 3)
+	checkLeafNodeConnected(t, leafSh)
+
+	ncLeafSh, jsLeafSh := jsClientConnect(t, leafSh, nats.UserInfo("u", "u"))
+	defer ncLeafSh.Close()
+
+	sc := &nats.StreamConfig{
+		Name:        "leaf-sh",
+		Subjects:    []string{"leaf2leaf.>"},
+		Retention:   nats.LimitsPolicy,
+		Storage:     nats.FileStorage,
+		AllowRollup: true,
+		AllowDirect: true,
+	}
+	_, err := jsLeafSh.AddStream(sc)
+	require_NoError(t, err)
+
+	ncLeafJS, jsLeafJS := jsClientConnect(t, leafJS, nats.UserInfo("u", "u"))
+	defer ncLeafJS.Close()
+
+	sc = &nats.StreamConfig{
+		Name:        "leaf-js",
+		Retention:   nats.LimitsPolicy,
+		Storage:     nats.FileStorage,
+		AllowRollup: true,
+		AllowDirect: true,
+		Sources: []*nats.StreamSource{
+			{
+				Name: "leaf-sh",
+				External: &nats.ExternalStream{
+					APIPrefix:     "$JS.leaf-sh.API",
+					DeliverPrefix: "sync.leaf-sh.jspush"},
+			},
+		},
+	}
+	_, err = jsLeafJS.AddStream(sc)
+	require_NoError(t, err)
+
+	for range 10 {
+		_, err = jsLeafSh.Publish("leaf2leaf.v1.test", []byte("hello"))
+		require_NoError(t, err)
+	}
+
+	check := func(js nats.JetStreamContext, stream string) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			si, err := js.StreamInfo(stream)
+			if err != nil {
+				return err
+			}
+			if n := si.State.Msgs; n != 10 {
+				return fmt.Errorf("Expected 10 messages, got %v", n)
+			}
+			return nil
+		})
+	}
+	check(jsLeafSh, "leaf-sh")
+	check(jsLeafJS, "leaf-js")
+
+	acc := other.GlobalAccount()
+	acc.mu.RLock()
+	sr := acc.sl.ReverseMatch("sync.leaf-sh.jspush.>")
+	acc.mu.RUnlock()
+	require_Len(t, len(sr.psubs), 0)
 }
