@@ -1,4 +1,4 @@
-// Copyright 2024-2025 The NATS Authors
+// Copyright 2024-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -48,6 +48,12 @@ type HashWheel struct {
 	count  uint64  // How many entries are present?
 }
 
+// HashWheelEntry represents a single entry in the wheel.
+type HashWheelEntry struct {
+	Seq     uint64
+	Expires int64
+}
+
 // NewHashWheel initializes a new HashWheel.
 func NewHashWheel() *HashWheel {
 	return &HashWheel{
@@ -59,17 +65,6 @@ func NewHashWheel() *HashWheel {
 // getPosition calculates the slot position for a given expiration time.
 func (hw *HashWheel) getPosition(expires int64) int64 {
 	return (expires / tickDuration) & wheelMask
-}
-
-// updateLowestExpires finds the new lowest expiration time across all slots.
-func (hw *HashWheel) updateLowestExpires() {
-	lowest := int64(math.MaxInt64)
-	for _, s := range hw.wheel {
-		if s != nil && s.lowest < lowest {
-			lowest = s.lowest
-		}
-	}
-	hw.lowest = lowest
 }
 
 // newSlot creates a new slot.
@@ -120,22 +115,7 @@ func (hw *HashWheel) Remove(seq uint64, expires int64) error {
 	// If the slot is empty, we can set it to nil to free memory.
 	if len(s.entries) == 0 {
 		hw.wheel[pos] = nil
-	} else if expires == s.lowest {
-		// Find new lowest in this slot.
-		lowest := int64(math.MaxInt64)
-		for _, exp := range s.entries {
-			if exp < lowest {
-				lowest = exp
-			}
-		}
-		s.lowest = lowest
 	}
-
-	// If we removed the global lowest, find the new one.
-	if expires == hw.lowest {
-		hw.updateLowestExpires()
-	}
-
 	return nil
 }
 
@@ -175,8 +155,11 @@ func (hw *HashWheel) expireTasks(ts int64, callback func(seq uint64, expires int
 		slotLowest := int64(math.MaxInt64)
 		for seq, expires := range s.entries {
 			if expires <= ts && callback(seq, expires) {
-				delete(s.entries, seq)
-				hw.count--
+				// Only remove if not done so already by the callback.
+				if _, ok := s.entries[seq]; ok {
+					delete(s.entries, seq)
+					hw.count--
+				}
 				continue
 			}
 			if expires < slotLowest {
@@ -247,11 +230,11 @@ func (hw *HashWheel) Decode(b []byte) (uint64, error) {
 	b = b[headerLen:]
 	for i := uint64(0); i < count; i++ {
 		ts, tn := binary.Varint(b)
-		if tn < 0 {
+		if tn <= 0 {
 			return 0, io.ErrUnexpectedEOF
 		}
 		v, vn := binary.Uvarint(b[tn:])
-		if vn < 0 {
+		if vn <= 0 {
 			return 0, io.ErrUnexpectedEOF
 		}
 		hw.Add(v, ts)

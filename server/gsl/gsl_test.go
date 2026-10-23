@@ -1,4 +1,4 @@
-// Copyright 2016-2025 The NATS Authors
+// Copyright 2016-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,7 +18,6 @@ import (
 	"testing"
 
 	"github.com/nats-io/nats-server/v2/internal/antithesis"
-	"github.com/nats-io/nats-server/v2/server/stree"
 )
 
 func TestGenericSublistInit(t *testing.T) {
@@ -235,6 +234,128 @@ func TestGenericSublistHasInterest(t *testing.T) {
 	require_NoError(t, s.Remove("*", 66))
 }
 
+func TestGenericSublistHasInterestOverlapping(t *testing.T) {
+	s := NewSublist[int]()
+	require_NoError(t, s.Insert("stream.A.child", 11))
+	require_NoError(t, s.Insert("stream.*", 11))
+	require_True(t, s.HasInterest("stream.A.child"))
+	require_True(t, s.HasInterest("stream.A"))
+}
+
+func TestGenericSublistMatchesFullWildcard(t *testing.T) {
+	s := NewSublist[int]()
+	require_NoError(t, s.Insert("stream.A.child", 11))
+	require_NoError(t, s.Insert("stream.*", 11))
+	require_True(t, s.HasInterest("stream.A.child"))
+	require_True(t, s.HasInterest("stream.A"))
+	require_False(t, s.MatchesFullWildcard())
+
+	require_NoError(t, s.Insert(">", 11))
+	require_True(t, s.MatchesFullWildcard())
+}
+
+func TestGenericSublistSingleFilter(t *testing.T) {
+	var sn *GenericSublist[int]
+	filter, ok := sn.MatchesSingleFilter()
+	require_False(t, ok)
+	require_Equal(t, filter, _EMPTY_)
+
+	s := NewSublist[int]()
+	filter, ok = s.MatchesSingleFilter()
+	require_False(t, ok)
+	require_Equal(t, filter, _EMPTY_)
+
+	require_NoError(t, s.Insert("stream.A.child", 11))
+	filter, ok = s.MatchesSingleFilter()
+	require_True(t, ok)
+	require_Equal(t, filter, "stream.A.child")
+
+	require_NoError(t, s.Insert("stream.A.child", 22))
+	filter, ok = s.MatchesSingleFilter()
+	require_True(t, ok)
+	require_Equal(t, filter, "stream.A.child")
+
+	require_NoError(t, s.Insert("stream.A.other", 22))
+	filter, ok = s.MatchesSingleFilter()
+	require_False(t, ok)
+	require_Equal(t, filter, _EMPTY_)
+
+	require_NoError(t, s.Insert("stream.*", 33))
+	filter, ok = s.MatchesSingleFilter()
+	require_False(t, ok)
+	require_Equal(t, filter, _EMPTY_)
+
+	// Test that an ancestor with descendants correctly returns false.
+	s2 := NewSublist[int]()
+	require_NoError(t, s2.Insert("foo", 1))
+	require_NoError(t, s2.Insert("foo.bar", 2))
+	require_NoError(t, s2.Insert("foo.baz", 3))
+	filter, ok = s2.MatchesSingleFilter()
+	require_False(t, ok)
+	require_Equal(t, filter, _EMPTY_)
+
+	// Test that an ancestor with only descendants correctly returns false.
+	s3 := NewSublist[int]()
+	require_NoError(t, s3.Insert("foo.bar", 2))
+	require_NoError(t, s3.Insert("foo.baz", 3))
+	filter, ok = s3.MatchesSingleFilter()
+	require_False(t, ok)
+	require_Equal(t, filter, _EMPTY_)
+}
+
+// TestGenericSublistHasInterestStartingInRace tests that HasInterestStartingIn
+// is safe to call concurrently with modifications to the sublist.
+func TestGenericSublistHasInterestStartingInRace(t *testing.T) {
+	s := NewSublist[int]()
+
+	// Pre-populate with some patterns
+	for i := 0; i < 10; i++ {
+		s.Insert("foo.bar.baz", i)
+		s.Insert("foo.*.baz", i+10)
+		s.Insert("foo.>", i+20)
+	}
+
+	done := make(chan struct{})
+	const iterations = 1000
+
+	// Goroutine 1: repeatedly call HasInterestStartingIn
+	go func() {
+		for i := 0; i < iterations; i++ {
+			s.HasInterestStartingIn("foo")
+			s.HasInterestStartingIn("foo.bar")
+			s.HasInterestStartingIn("foo.bar.baz")
+			s.HasInterestStartingIn("other.subject")
+		}
+		done <- struct{}{}
+	}()
+
+	// Goroutine 2: repeatedly modify the sublist
+	go func() {
+		for i := 0; i < iterations; i++ {
+			val := 1000 + i
+			s.Insert("test.subject."+string(rune('a'+i%26)), val)
+			s.Insert("foo.*.test", val)
+			s.Remove("test.subject."+string(rune('a'+i%26)), val)
+			s.Remove("foo.*.test", val)
+		}
+		done <- struct{}{}
+	}()
+
+	// Goroutine 3: also call HasInterest (which does lock)
+	go func() {
+		for i := 0; i < iterations; i++ {
+			s.HasInterest("foo.bar.baz")
+			s.HasInterest("foo.something.baz")
+		}
+		done <- struct{}{}
+	}()
+
+	// Wait for all goroutines
+	<-done
+	<-done
+	<-done
+}
+
 func TestGenericSublistNumInterest(t *testing.T) {
 	s := NewSublist[int]()
 	require_NoError(t, s.Insert("foo", 11))
@@ -292,155 +413,6 @@ func TestGenericSublistNumInterest(t *testing.T) {
 	require_NumInterest(t, "foo", 1)
 	require_NumInterest(t, "foo.bar", 0)
 	require_NoError(t, s.Remove("*", 66))
-}
-
-func TestGenericSublistInterestBasedIntersection(t *testing.T) {
-	st := stree.NewSubjectTree[struct{}]()
-	st.Insert([]byte("one.two.three.four"), struct{}{})
-	st.Insert([]byte("one.two.three.five"), struct{}{})
-	st.Insert([]byte("one.two.six"), struct{}{})
-	st.Insert([]byte("one.two.seven"), struct{}{})
-	st.Insert([]byte("eight.nine"), struct{}{})
-	st.Insert([]byte("stream.A"), struct{}{})
-	st.Insert([]byte("stream.A.child"), struct{}{})
-
-	require_NoDuplicates := func(t *testing.T, got map[string]int) {
-		t.Helper()
-		for _, c := range got {
-			require_Equal(t, c, 1)
-		}
-	}
-
-	t.Run("Literals", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one.two.six", 11))
-		require_NoError(t, sl.Insert("eight.nine", 22))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("PWC", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one.two.*.*", 11))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("PWCOverlapping", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one.two.*.four", 11))
-		require_NoError(t, sl.Insert("one.two.*.*", 22))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("PWCAll", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("*.*", 11))
-		require_NoError(t, sl.Insert("*.*.*", 22))
-		require_NoError(t, sl.Insert("*.*.*.*", 33))
-		require_True(t, sl.HasInterest("foo.bar"))
-		require_True(t, sl.HasInterest("foo.bar.baz"))
-		require_True(t, sl.HasInterest("foo.bar.baz.qux"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 7)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWC", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one.>", 11))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 4)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWCOverlapping", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one.two.three.four", 11))
-		require_NoError(t, sl.Insert("one.>", 22))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 4)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWCExtended", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("stream.A.>", 11))
-		require_NoError(t, sl.Insert("stream.A", 22))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWCAll", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert(">", 11))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 7)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("NoMatch", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one", 11))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 0)
-	})
-
-	t.Run("NoMatches", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("one", 11))
-		require_NoError(t, sl.Insert("eight", 22))
-		require_NoError(t, sl.Insert("ten", 33))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 0)
-	})
-
-	t.Run("NoMatchPartial", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublist[int]()
-		require_NoError(t, sl.Insert("stream.A.not-child", 11))
-		require_NoError(t, sl.Insert("stream.A.child.>", 22))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 0)
-		require_NoDuplicates(t, got)
-	})
 }
 
 // --- TEST HELPERS ---
@@ -513,13 +485,5 @@ func require_Equal[T comparable](t testing.TB, a, b T) {
 	if a != b {
 		antithesis.AssertUnreachable(t, "Failed require_Equal check", nil)
 		t.Fatalf("require %T equal, but got: %v != %v", a, a, b)
-	}
-}
-
-func require_Len(t testing.TB, a, b int) {
-	t.Helper()
-	if a != b {
-		antithesis.AssertUnreachable(t, "Failed require_Len check", nil)
-		t.Fatalf("require len, but got: %v != %v", a, b)
 	}
 }

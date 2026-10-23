@@ -8,11 +8,17 @@ const (
 	// JSAccountResourcesExceededErr resource limits exceeded for account
 	JSAccountResourcesExceededErr ErrorIdentifier = 10002
 
+	// JSAtomicPublishContainsDuplicateMessageErr atomic publish batch contains duplicate message id
+	JSAtomicPublishContainsDuplicateMessageErr ErrorIdentifier = 10201
+
 	// JSAtomicPublishDisabledErr atomic publish is disabled
 	JSAtomicPublishDisabledErr ErrorIdentifier = 10174
 
 	// JSAtomicPublishIncompleteBatchErr atomic publish batch is incomplete
 	JSAtomicPublishIncompleteBatchErr ErrorIdentifier = 10176
+
+	// JSAtomicPublishInvalidBatchCommitErr atomic publish batch commit is invalid
+	JSAtomicPublishInvalidBatchCommitErr ErrorIdentifier = 10200
 
 	// JSAtomicPublishInvalidBatchIDErr atomic publish batch ID is invalid
 	JSAtomicPublishInvalidBatchIDErr ErrorIdentifier = 10179
@@ -20,11 +26,32 @@ const (
 	// JSAtomicPublishMissingSeqErr atomic publish sequence is missing
 	JSAtomicPublishMissingSeqErr ErrorIdentifier = 10175
 
+	// JSAtomicPublishTooLargeBatchErrF atomic publish batch is too large: {size}
+	JSAtomicPublishTooLargeBatchErrF ErrorIdentifier = 10199
+
+	// JSAtomicPublishTooManyInflight atomic publish too many inflight
+	JSAtomicPublishTooManyInflight ErrorIdentifier = 10210
+
 	// JSAtomicPublishUnsupportedHeaderBatchErr atomic publish unsupported header used: {header}
 	JSAtomicPublishUnsupportedHeaderBatchErr ErrorIdentifier = 10177
 
 	// JSBadRequestErr bad request
 	JSBadRequestErr ErrorIdentifier = 10003
+
+	// JSBatchPublishDisabledErr batch publish is disabled
+	JSBatchPublishDisabledErr ErrorIdentifier = 10205
+
+	// JSBatchPublishInvalidBatchIDErr batch publish ID is invalid
+	JSBatchPublishInvalidBatchIDErr ErrorIdentifier = 10207
+
+	// JSBatchPublishInvalidPatternErr batch publish pattern is invalid
+	JSBatchPublishInvalidPatternErr ErrorIdentifier = 10206
+
+	// JSBatchPublishTooManyInflight batch publish too many inflight
+	JSBatchPublishTooManyInflight ErrorIdentifier = 10211
+
+	// JSBatchPublishUnknownBatchIDErr batch publish ID unknown
+	JSBatchPublishUnknownBatchIDErr ErrorIdentifier = 10208
 
 	// JSClusterIncompleteErr incomplete results
 	JSClusterIncompleteErr ErrorIdentifier = 10004
@@ -50,6 +77,12 @@ const (
 	// JSClusterRequiredErr JetStream clustering support required
 	JSClusterRequiredErr ErrorIdentifier = 10010
 
+	// JSClusterRescueErr JetStream system rescue not applied: {err}
+	JSClusterRescueErr ErrorIdentifier = 10224
+
+	// JSClusterServerMemberChangeInflightErr cluster member change is in progress
+	JSClusterServerMemberChangeInflightErr ErrorIdentifier = 10202
+
 	// JSClusterServerNotMemberErr server is not a member of the cluster
 	JSClusterServerNotMemberErr ErrorIdentifier = 10044
 
@@ -58,6 +91,21 @@ const (
 
 	// JSClusterUnSupportFeatureErr not currently supported in clustered mode
 	JSClusterUnSupportFeatureErr ErrorIdentifier = 10036
+
+	// JSConsumerAckFCRequiresFCErr flow control ack policy requires flow control
+	JSConsumerAckFCRequiresFCErr ErrorIdentifier = 10219
+
+	// JSConsumerAckFCRequiresMaxAckPendingErr flow control ack policy requires max ack pending
+	JSConsumerAckFCRequiresMaxAckPendingErr ErrorIdentifier = 10220
+
+	// JSConsumerAckFCRequiresNoAckWaitErr flow control ack policy requires unset ack wait
+	JSConsumerAckFCRequiresNoAckWaitErr ErrorIdentifier = 10221
+
+	// JSConsumerAckFCRequiresNoMaxDeliverErr flow control ack policy requires unset max deliver
+	JSConsumerAckFCRequiresNoMaxDeliverErr ErrorIdentifier = 10222
+
+	// JSConsumerAckFCRequiresPushErr flow control ack policy requires a push based consumer
+	JSConsumerAckFCRequiresPushErr ErrorIdentifier = 10218
 
 	// JSConsumerAckPolicyInvalidErr consumer ack policy invalid
 	JSConsumerAckPolicyInvalidErr ErrorIdentifier = 10181
@@ -155,6 +203,9 @@ const (
 	// JSConsumerInvalidPriorityGroupErr Provided priority group does not exist for this consumer
 	JSConsumerInvalidPriorityGroupErr ErrorIdentifier = 10160
 
+	// JSConsumerInvalidResetErr invalid reset: {err}
+	JSConsumerInvalidResetErr ErrorIdentifier = 10204
+
 	// JSConsumerInvalidSamplingErrF failed to parse consumer sampling configuration: {err}
 	JSConsumerInvalidSamplingErrF ErrorIdentifier = 10095
 
@@ -251,6 +302,9 @@ const (
 	// JSConsumerStoreFailedErrF error creating store for consumer: {err}
 	JSConsumerStoreFailedErrF ErrorIdentifier = 10104
 
+	// JSConsumerStreamIdentityMismatchF consumer's stream identity does not match: {msg}
+	JSConsumerStreamIdentityMismatchF ErrorIdentifier = 10225
+
 	// JSConsumerWQConsumerNotDeliverAllErr consumer must be deliver all on workqueue stream
 	JSConsumerWQConsumerNotDeliverAllErr ErrorIdentifier = 10101
 
@@ -305,11 +359,23 @@ const (
 	// JSMessageSchedulesRollupInvalidErr message schedules invalid rollup
 	JSMessageSchedulesRollupInvalidErr ErrorIdentifier = 10192
 
+	// JSMessageSchedulesSchedulerInvalidErr message schedules invalid scheduler
+	JSMessageSchedulesSchedulerInvalidErr ErrorIdentifier = 10212
+
+	// JSMessageSchedulesSourceInvalidErr message schedules source is invalid
+	JSMessageSchedulesSourceInvalidErr ErrorIdentifier = 10203
+
 	// JSMessageSchedulesTTLInvalidErr message schedules invalid per-message TTL
 	JSMessageSchedulesTTLInvalidErr ErrorIdentifier = 10191
 
 	// JSMessageSchedulesTargetInvalidErr message schedules target is invalid
 	JSMessageSchedulesTargetInvalidErr ErrorIdentifier = 10190
+
+	// JSMessageSchedulesTimeZoneInvalidErr message schedules time zone is invalid
+	JSMessageSchedulesTimeZoneInvalidErr ErrorIdentifier = 10223
+
+	// JSMessageSourceHdrNotAllowedErr message stream source header is not allowed
+	JSMessageSourceHdrNotAllowedErr ErrorIdentifier = 10227
 
 	// JSMessageTTLDisabledErr per-message TTL is disabled
 	JSMessageTTLDisabledErr ErrorIdentifier = 10166
@@ -317,8 +383,14 @@ const (
 	// JSMessageTTLInvalidErr invalid per-message TTL
 	JSMessageTTLInvalidErr ErrorIdentifier = 10165
 
+	// JSMirrorConsumerRequiresAckFCErr stream mirror consumer requires flow control ack policy
+	JSMirrorConsumerRequiresAckFCErr ErrorIdentifier = 10214
+
 	// JSMirrorConsumerSetupFailedErrF generic mirror consumer setup failure string ({err})
 	JSMirrorConsumerSetupFailedErrF ErrorIdentifier = 10029
+
+	// JSMirrorDurableConsumerCfgInvalid stream mirror consumer config is invalid
+	JSMirrorDurableConsumerCfgInvalid ErrorIdentifier = 10213
 
 	// JSMirrorInvalidStreamName mirrored stream name is invalid
 	JSMirrorInvalidStreamName ErrorIdentifier = 10142
@@ -337,6 +409,12 @@ const (
 
 	// JSMirrorOverlappingSubjectFilters mirror subject filters can not overlap
 	JSMirrorOverlappingSubjectFilters ErrorIdentifier = 10152
+
+	// JSMirrorWithAtomicPublishErr stream mirrors can not also use atomic publishing
+	JSMirrorWithAtomicPublishErr ErrorIdentifier = 10198
+
+	// JSMirrorWithBatchPublishErr stream mirrors can not also use batch publishing
+	JSMirrorWithBatchPublishErr ErrorIdentifier = 10209
 
 	// JSMirrorWithCountersErr stream mirrors can not also calculate counters
 	JSMirrorWithCountersErr ErrorIdentifier = 10173
@@ -401,11 +479,23 @@ const (
 	// JSSnapshotDeliverSubjectInvalidErr deliver subject not valid
 	JSSnapshotDeliverSubjectInvalidErr ErrorIdentifier = 10015
 
+	// JSSourceConsumerFlowControlStalledErr stream source consumer stalled on flow control
+	JSSourceConsumerFlowControlStalledErr ErrorIdentifier = 10228
+
+	// JSSourceConsumerRequiresAckFCErr stream source consumer requires flow control ack policy
+	JSSourceConsumerRequiresAckFCErr ErrorIdentifier = 10217
+
 	// JSSourceConsumerSetupFailedErrF General source consumer setup failure string ({err})
 	JSSourceConsumerSetupFailedErrF ErrorIdentifier = 10045
 
 	// JSSourceDuplicateDetected source stream, filter and transform (plus external if present) must form a unique combination (duplicate source configuration detected)
 	JSSourceDuplicateDetected ErrorIdentifier = 10140
+
+	// JSSourceDurableConsumerCfgInvalid stream source consumer config is invalid
+	JSSourceDurableConsumerCfgInvalid ErrorIdentifier = 10215
+
+	// JSSourceDurableConsumerDuplicateDetected duplicate stream source consumer detected
+	JSSourceDurableConsumerDuplicateDetected ErrorIdentifier = 10216
 
 	// JSSourceInvalidStreamName sourced stream name is invalid
 	JSSourceInvalidStreamName ErrorIdentifier = 10141
@@ -497,11 +587,8 @@ const (
 	// JSStreamMoveAndScaleErr can not move and scale a stream in a single update
 	JSStreamMoveAndScaleErr ErrorIdentifier = 10123
 
-	// JSStreamMoveInProgressF stream move already in progress: {msg}
-	JSStreamMoveInProgressF ErrorIdentifier = 10124
-
-	// JSStreamMoveNotInProgress stream move not in progress
-	JSStreamMoveNotInProgress ErrorIdentifier = 10129
+	// JSStreamMoveInProgressErr stream move already in progress
+	JSStreamMoveInProgressErr ErrorIdentifier = 10124
 
 	// JSStreamMsgDeleteFailedF Generic message deletion failure error string ({err})
 	JSStreamMsgDeleteFailedF ErrorIdentifier = 10057
@@ -529,6 +616,12 @@ const (
 
 	// JSStreamPurgeFailedF Generic stream purge failure error string ({err})
 	JSStreamPurgeFailedF ErrorIdentifier = 10110
+
+	// JSStreamReconfigureInProgressErr stream reconfiguration already in progress
+	JSStreamReconfigureInProgressErr ErrorIdentifier = 10226
+
+	// JSStreamReconfigureNotInProgressErr stream reconfiguration not in progress
+	JSStreamReconfigureNotInProgressErr ErrorIdentifier = 10129
 
 	// JSStreamReplicasNotSupportedErr replicas > 1 not supported in non-clustered mode
 	JSStreamReplicasNotSupportedErr ErrorIdentifier = 10074
@@ -597,12 +690,21 @@ const (
 var (
 	ApiErrors = map[ErrorIdentifier]*ApiError{
 		JSAccountResourcesExceededErr:                {Code: 400, ErrCode: 10002, Description: "resource limits exceeded for account"},
+		JSAtomicPublishContainsDuplicateMessageErr:   {Code: 400, ErrCode: 10201, Description: "atomic publish batch contains duplicate message id"},
 		JSAtomicPublishDisabledErr:                   {Code: 400, ErrCode: 10174, Description: "atomic publish is disabled"},
 		JSAtomicPublishIncompleteBatchErr:            {Code: 400, ErrCode: 10176, Description: "atomic publish batch is incomplete"},
+		JSAtomicPublishInvalidBatchCommitErr:         {Code: 400, ErrCode: 10200, Description: "atomic publish batch commit is invalid"},
 		JSAtomicPublishInvalidBatchIDErr:             {Code: 400, ErrCode: 10179, Description: "atomic publish batch ID is invalid"},
 		JSAtomicPublishMissingSeqErr:                 {Code: 400, ErrCode: 10175, Description: "atomic publish sequence is missing"},
+		JSAtomicPublishTooLargeBatchErrF:             {Code: 400, ErrCode: 10199, Description: "atomic publish batch is too large: {size}"},
+		JSAtomicPublishTooManyInflight:               {Code: 429, ErrCode: 10210, Description: "atomic publish too many inflight"},
 		JSAtomicPublishUnsupportedHeaderBatchErr:     {Code: 400, ErrCode: 10177, Description: "atomic publish unsupported header used: {header}"},
 		JSBadRequestErr:                              {Code: 400, ErrCode: 10003, Description: "bad request"},
+		JSBatchPublishDisabledErr:                    {Code: 400, ErrCode: 10205, Description: "batch publish is disabled"},
+		JSBatchPublishInvalidBatchIDErr:              {Code: 400, ErrCode: 10207, Description: "batch publish ID is invalid"},
+		JSBatchPublishInvalidPatternErr:              {Code: 400, ErrCode: 10206, Description: "batch publish pattern is invalid"},
+		JSBatchPublishTooManyInflight:                {Code: 429, ErrCode: 10211, Description: "batch publish too many inflight"},
+		JSBatchPublishUnknownBatchIDErr:              {Code: 400, ErrCode: 10208, Description: "batch publish ID unknown"},
 		JSClusterIncompleteErr:                       {Code: 503, ErrCode: 10004, Description: "incomplete results"},
 		JSClusterNoPeersErrF:                         {Code: 400, ErrCode: 10005, Description: "{err}"},
 		JSClusterNotActiveErr:                        {Code: 500, ErrCode: 10006, Description: "JetStream not in clustered mode"},
@@ -611,9 +713,16 @@ var (
 		JSClusterNotLeaderErr:                        {Code: 500, ErrCode: 10009, Description: "JetStream cluster can not handle request"},
 		JSClusterPeerNotMemberErr:                    {Code: 400, ErrCode: 10040, Description: "peer not a member"},
 		JSClusterRequiredErr:                         {Code: 503, ErrCode: 10010, Description: "JetStream clustering support required"},
+		JSClusterRescueErr:                           {Code: 400, ErrCode: 10224, Description: "JetStream system rescue not applied: {err}"},
+		JSClusterServerMemberChangeInflightErr:       {Code: 400, ErrCode: 10202, Description: "cluster member change is in progress"},
 		JSClusterServerNotMemberErr:                  {Code: 400, ErrCode: 10044, Description: "server is not a member of the cluster"},
 		JSClusterTagsErr:                             {Code: 400, ErrCode: 10011, Description: "tags placement not supported for operation"},
 		JSClusterUnSupportFeatureErr:                 {Code: 503, ErrCode: 10036, Description: "not currently supported in clustered mode"},
+		JSConsumerAckFCRequiresFCErr:                 {Code: 400, ErrCode: 10219, Description: "flow control ack policy requires flow control"},
+		JSConsumerAckFCRequiresMaxAckPendingErr:      {Code: 400, ErrCode: 10220, Description: "flow control ack policy requires max ack pending"},
+		JSConsumerAckFCRequiresNoAckWaitErr:          {Code: 400, ErrCode: 10221, Description: "flow control ack policy requires unset ack wait"},
+		JSConsumerAckFCRequiresNoMaxDeliverErr:       {Code: 400, ErrCode: 10222, Description: "flow control ack policy requires unset max deliver"},
+		JSConsumerAckFCRequiresPushErr:               {Code: 400, ErrCode: 10218, Description: "flow control ack policy requires a push based consumer"},
 		JSConsumerAckPolicyInvalidErr:                {Code: 400, ErrCode: 10181, Description: "consumer ack policy invalid"},
 		JSConsumerAckWaitNegativeErr:                 {Code: 400, ErrCode: 10183, Description: "consumer ack wait needs to be positive"},
 		JSConsumerAlreadyExists:                      {Code: 400, ErrCode: 10148, Description: "consumer already exists"},
@@ -646,6 +755,7 @@ var (
 		JSConsumerInvalidGroupNameErr:                {Code: 400, ErrCode: 10162, Description: "Valid priority group name must match A-Z, a-z, 0-9, -_/=)+ and may not exceed 16 characters"},
 		JSConsumerInvalidPolicyErrF:                  {Code: 400, ErrCode: 10094, Description: "{err}"},
 		JSConsumerInvalidPriorityGroupErr:            {Code: 400, ErrCode: 10160, Description: "Provided priority group does not exist for this consumer"},
+		JSConsumerInvalidResetErr:                    {Code: 400, ErrCode: 10204, Description: "invalid reset: {err}"},
 		JSConsumerInvalidSamplingErrF:                {Code: 400, ErrCode: 10095, Description: "failed to parse consumer sampling configuration: {err}"},
 		JSConsumerMaxDeliverBackoffErr:               {Code: 400, ErrCode: 10116, Description: "max deliver is required to be > length of backoff values"},
 		JSConsumerMaxPendingAckExcessErrF:            {Code: 400, ErrCode: 10121, Description: "consumer max ack pending exceeds system limit of {limit}"},
@@ -678,6 +788,7 @@ var (
 		JSConsumerReplicasShouldMatchStream:          {Code: 400, ErrCode: 10134, Description: "consumer config replicas must match interest retention stream's replicas"},
 		JSConsumerSmallHeartbeatErr:                  {Code: 400, ErrCode: 10083, Description: "consumer idle heartbeat needs to be >= 100ms"},
 		JSConsumerStoreFailedErrF:                    {Code: 500, ErrCode: 10104, Description: "error creating store for consumer: {err}"},
+		JSConsumerStreamIdentityMismatchF:            {Code: 400, ErrCode: 10225, Description: "consumer's stream identity does not match: {msg}"},
 		JSConsumerWQConsumerNotDeliverAllErr:         {Code: 400, ErrCode: 10101, Description: "consumer must be deliver all on workqueue stream"},
 		JSConsumerWQConsumerNotUniqueErr:             {Code: 400, ErrCode: 10100, Description: "filtered consumer not unique on workqueue stream"},
 		JSConsumerWQMultipleUnfilteredErr:            {Code: 400, ErrCode: 10099, Description: "multiple non-filtered consumers not allowed on workqueue stream"},
@@ -696,17 +807,25 @@ var (
 		JSMessageSchedulesDisabledErr:                {Code: 400, ErrCode: 10188, Description: "message schedules is disabled"},
 		JSMessageSchedulesPatternInvalidErr:          {Code: 400, ErrCode: 10189, Description: "message schedules pattern is invalid"},
 		JSMessageSchedulesRollupInvalidErr:           {Code: 400, ErrCode: 10192, Description: "message schedules invalid rollup"},
+		JSMessageSchedulesSchedulerInvalidErr:        {Code: 400, ErrCode: 10212, Description: "message schedules invalid scheduler"},
+		JSMessageSchedulesSourceInvalidErr:           {Code: 400, ErrCode: 10203, Description: "message schedules source is invalid"},
 		JSMessageSchedulesTTLInvalidErr:              {Code: 400, ErrCode: 10191, Description: "message schedules invalid per-message TTL"},
 		JSMessageSchedulesTargetInvalidErr:           {Code: 400, ErrCode: 10190, Description: "message schedules target is invalid"},
+		JSMessageSchedulesTimeZoneInvalidErr:         {Code: 400, ErrCode: 10223, Description: "message schedules time zone is invalid"},
+		JSMessageSourceHdrNotAllowedErr:              {Code: 400, ErrCode: 10227, Description: "message stream source header is not allowed"},
 		JSMessageTTLDisabledErr:                      {Code: 400, ErrCode: 10166, Description: "per-message TTL is disabled"},
 		JSMessageTTLInvalidErr:                       {Code: 400, ErrCode: 10165, Description: "invalid per-message TTL"},
+		JSMirrorConsumerRequiresAckFCErr:             {Code: 400, ErrCode: 10214, Description: "stream mirror consumer requires flow control ack policy"},
 		JSMirrorConsumerSetupFailedErrF:              {Code: 500, ErrCode: 10029, Description: "{err}"},
+		JSMirrorDurableConsumerCfgInvalid:            {Code: 400, ErrCode: 10213, Description: "stream mirror consumer config is invalid"},
 		JSMirrorInvalidStreamName:                    {Code: 400, ErrCode: 10142, Description: "mirrored stream name is invalid"},
 		JSMirrorInvalidSubjectFilter:                 {Code: 400, ErrCode: 10151, Description: "mirror transform source: {err}"},
 		JSMirrorInvalidTransformDestination:          {Code: 400, ErrCode: 10154, Description: "mirror transform: {err}"},
 		JSMirrorMaxMessageSizeTooBigErr:              {Code: 400, ErrCode: 10030, Description: "stream mirror must have max message size >= source"},
 		JSMirrorMultipleFiltersNotAllowed:            {Code: 400, ErrCode: 10150, Description: "mirror with multiple subject transforms cannot also have a single subject filter"},
 		JSMirrorOverlappingSubjectFilters:            {Code: 400, ErrCode: 10152, Description: "mirror subject filters can not overlap"},
+		JSMirrorWithAtomicPublishErr:                 {Code: 400, ErrCode: 10198, Description: "stream mirrors can not also use atomic publishing"},
+		JSMirrorWithBatchPublishErr:                  {Code: 400, ErrCode: 10209, Description: "stream mirrors can not also use batch publishing"},
 		JSMirrorWithCountersErr:                      {Code: 400, ErrCode: 10173, Description: "stream mirrors can not also calculate counters"},
 		JSMirrorWithFirstSeqErr:                      {Code: 400, ErrCode: 10143, Description: "stream mirrors can not have first sequence configured"},
 		JSMirrorWithMsgSchedulesErr:                  {Code: 400, ErrCode: 10186, Description: "stream mirrors can not also schedule messages"},
@@ -728,8 +847,12 @@ var (
 		JSRestoreSubscribeFailedErrF:                 {Code: 500, ErrCode: 10042, Description: "JetStream unable to subscribe to restore snapshot {subject}: {err}"},
 		JSSequenceNotFoundErrF:                       {Code: 400, ErrCode: 10043, Description: "sequence {seq} not found"},
 		JSSnapshotDeliverSubjectInvalidErr:           {Code: 400, ErrCode: 10015, Description: "deliver subject not valid"},
+		JSSourceConsumerFlowControlStalledErr:        {Code: 500, ErrCode: 10228, Description: "stream source consumer stalled on flow control"},
+		JSSourceConsumerRequiresAckFCErr:             {Code: 400, ErrCode: 10217, Description: "stream source consumer requires flow control ack policy"},
 		JSSourceConsumerSetupFailedErrF:              {Code: 500, ErrCode: 10045, Description: "{err}"},
 		JSSourceDuplicateDetected:                    {Code: 400, ErrCode: 10140, Description: "duplicate source configuration detected"},
+		JSSourceDurableConsumerCfgInvalid:            {Code: 400, ErrCode: 10215, Description: "stream source consumer config is invalid"},
+		JSSourceDurableConsumerDuplicateDetected:     {Code: 400, ErrCode: 10216, Description: "duplicate stream source consumer detected"},
 		JSSourceInvalidStreamName:                    {Code: 400, ErrCode: 10141, Description: "sourced stream name is invalid"},
 		JSSourceInvalidSubjectFilter:                 {Code: 400, ErrCode: 10145, Description: "source transform source: {err}"},
 		JSSourceInvalidTransformDestination:          {Code: 400, ErrCode: 10146, Description: "source transform: {err}"},
@@ -760,8 +883,7 @@ var (
 		JSStreamMirrorNotUpdatableErr:                {Code: 400, ErrCode: 10055, Description: "stream mirror configuration can not be updated"},
 		JSStreamMismatchErr:                          {Code: 400, ErrCode: 10056, Description: "stream name in subject does not match request"},
 		JSStreamMoveAndScaleErr:                      {Code: 400, ErrCode: 10123, Description: "can not move and scale a stream in a single update"},
-		JSStreamMoveInProgressF:                      {Code: 400, ErrCode: 10124, Description: "stream move already in progress: {msg}"},
-		JSStreamMoveNotInProgress:                    {Code: 400, ErrCode: 10129, Description: "stream move not in progress"},
+		JSStreamMoveInProgressErr:                    {Code: 400, ErrCode: 10124, Description: "stream move already in progress"},
 		JSStreamMsgDeleteFailedF:                     {Code: 500, ErrCode: 10057, Description: "{err}"},
 		JSStreamNameContainsPathSeparatorsErr:        {Code: 400, ErrCode: 10128, Description: "Stream name can not contain path separators"},
 		JSStreamNameExistErr:                         {Code: 400, ErrCode: 10058, Description: "stream name already in use with a different configuration"},
@@ -771,6 +893,8 @@ var (
 		JSStreamOfflineErr:                           {Code: 500, ErrCode: 10118, Description: "stream is offline"},
 		JSStreamOfflineReasonErrF:                    {Code: 500, ErrCode: 10194, Description: "stream is offline: {err}"},
 		JSStreamPurgeFailedF:                         {Code: 500, ErrCode: 10110, Description: "{err}"},
+		JSStreamReconfigureInProgressErr:             {Code: 400, ErrCode: 10226, Description: "stream reconfiguration already in progress"},
+		JSStreamReconfigureNotInProgressErr:          {Code: 400, ErrCode: 10129, Description: "stream reconfiguration not in progress"},
 		JSStreamReplicasNotSupportedErr:              {Code: 500, ErrCode: 10074, Description: "replicas > 1 not supported in non-clustered mode"},
 		JSStreamReplicasNotUpdatableErr:              {Code: 400, ErrCode: 10061, Description: "Replicas configuration can not be updated"},
 		JSStreamRestoreErrF:                          {Code: 500, ErrCode: 10062, Description: "restore failed: {err}"},
@@ -827,6 +951,16 @@ func NewJSAccountResourcesExceededError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSAccountResourcesExceededErr]
 }
 
+// NewJSAtomicPublishContainsDuplicateMessageError creates a new JSAtomicPublishContainsDuplicateMessageErr error: "atomic publish batch contains duplicate message id"
+func NewJSAtomicPublishContainsDuplicateMessageError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishContainsDuplicateMessageErr]
+}
+
 // NewJSAtomicPublishDisabledError creates a new JSAtomicPublishDisabledErr error: "atomic publish is disabled"
 func NewJSAtomicPublishDisabledError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -847,6 +981,16 @@ func NewJSAtomicPublishIncompleteBatchError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSAtomicPublishIncompleteBatchErr]
 }
 
+// NewJSAtomicPublishInvalidBatchCommitError creates a new JSAtomicPublishInvalidBatchCommitErr error: "atomic publish batch commit is invalid"
+func NewJSAtomicPublishInvalidBatchCommitError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishInvalidBatchCommitErr]
+}
+
 // NewJSAtomicPublishInvalidBatchIDError creates a new JSAtomicPublishInvalidBatchIDErr error: "atomic publish batch ID is invalid"
 func NewJSAtomicPublishInvalidBatchIDError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -865,6 +1009,32 @@ func NewJSAtomicPublishMissingSeqError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSAtomicPublishMissingSeqErr]
+}
+
+// NewJSAtomicPublishTooLargeBatchError creates a new JSAtomicPublishTooLargeBatchErrF error: "atomic publish batch is too large: {size}"
+func NewJSAtomicPublishTooLargeBatchError(size interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSAtomicPublishTooLargeBatchErrF]
+	args := e.toReplacerArgs([]interface{}{"{size}", size})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSAtomicPublishTooManyInflightError creates a new JSAtomicPublishTooManyInflight error: "atomic publish too many inflight"
+func NewJSAtomicPublishTooManyInflightError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSAtomicPublishTooManyInflight]
 }
 
 // NewJSAtomicPublishUnsupportedHeaderBatchError creates a new JSAtomicPublishUnsupportedHeaderBatchErr error: "atomic publish unsupported header used: {header}"
@@ -891,6 +1061,56 @@ func NewJSBadRequestError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSBadRequestErr]
+}
+
+// NewJSBatchPublishDisabledError creates a new JSBatchPublishDisabledErr error: "batch publish is disabled"
+func NewJSBatchPublishDisabledError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSBatchPublishDisabledErr]
+}
+
+// NewJSBatchPublishInvalidBatchIDError creates a new JSBatchPublishInvalidBatchIDErr error: "batch publish ID is invalid"
+func NewJSBatchPublishInvalidBatchIDError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSBatchPublishInvalidBatchIDErr]
+}
+
+// NewJSBatchPublishInvalidPatternError creates a new JSBatchPublishInvalidPatternErr error: "batch publish pattern is invalid"
+func NewJSBatchPublishInvalidPatternError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSBatchPublishInvalidPatternErr]
+}
+
+// NewJSBatchPublishTooManyInflightError creates a new JSBatchPublishTooManyInflight error: "batch publish too many inflight"
+func NewJSBatchPublishTooManyInflightError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSBatchPublishTooManyInflight]
+}
+
+// NewJSBatchPublishUnknownBatchIDError creates a new JSBatchPublishUnknownBatchIDErr error: "batch publish ID unknown"
+func NewJSBatchPublishUnknownBatchIDError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSBatchPublishUnknownBatchIDErr]
 }
 
 // NewJSClusterIncompleteError creates a new JSClusterIncompleteErr error: "incomplete results"
@@ -979,6 +1199,32 @@ func NewJSClusterRequiredError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSClusterRequiredErr]
 }
 
+// NewJSClusterRescueError creates a new JSClusterRescueErr error: "JetStream system rescue not applied: {err}"
+func NewJSClusterRescueError(err error, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSClusterRescueErr]
+	args := e.toReplacerArgs([]interface{}{"{err}", err})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSClusterServerMemberChangeInflightError creates a new JSClusterServerMemberChangeInflightErr error: "cluster member change is in progress"
+func NewJSClusterServerMemberChangeInflightError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSClusterServerMemberChangeInflightErr]
+}
+
 // NewJSClusterServerNotMemberError creates a new JSClusterServerNotMemberErr error: "server is not a member of the cluster"
 func NewJSClusterServerNotMemberError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1007,6 +1253,56 @@ func NewJSClusterUnSupportFeatureError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSClusterUnSupportFeatureErr]
+}
+
+// NewJSConsumerAckFCRequiresFCError creates a new JSConsumerAckFCRequiresFCErr error: "flow control ack policy requires flow control"
+func NewJSConsumerAckFCRequiresFCError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerAckFCRequiresFCErr]
+}
+
+// NewJSConsumerAckFCRequiresMaxAckPendingError creates a new JSConsumerAckFCRequiresMaxAckPendingErr error: "flow control ack policy requires max ack pending"
+func NewJSConsumerAckFCRequiresMaxAckPendingError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerAckFCRequiresMaxAckPendingErr]
+}
+
+// NewJSConsumerAckFCRequiresNoAckWaitError creates a new JSConsumerAckFCRequiresNoAckWaitErr error: "flow control ack policy requires unset ack wait"
+func NewJSConsumerAckFCRequiresNoAckWaitError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerAckFCRequiresNoAckWaitErr]
+}
+
+// NewJSConsumerAckFCRequiresNoMaxDeliverError creates a new JSConsumerAckFCRequiresNoMaxDeliverErr error: "flow control ack policy requires unset max deliver"
+func NewJSConsumerAckFCRequiresNoMaxDeliverError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerAckFCRequiresNoMaxDeliverErr]
+}
+
+// NewJSConsumerAckFCRequiresPushError creates a new JSConsumerAckFCRequiresPushErr error: "flow control ack policy requires a push based consumer"
+func NewJSConsumerAckFCRequiresPushError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerAckFCRequiresPushErr]
 }
 
 // NewJSConsumerAckPolicyInvalidError creates a new JSConsumerAckPolicyInvalidErr error: "consumer ack policy invalid"
@@ -1351,6 +1647,22 @@ func NewJSConsumerInvalidPriorityGroupError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSConsumerInvalidPriorityGroupErr]
+}
+
+// NewJSConsumerInvalidResetError creates a new JSConsumerInvalidResetErr error: "invalid reset: {err}"
+func NewJSConsumerInvalidResetError(err error, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSConsumerInvalidResetErr]
+	args := e.toReplacerArgs([]interface{}{"{err}", err})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
 }
 
 // NewJSConsumerInvalidSamplingError creates a new JSConsumerInvalidSamplingErrF error: "failed to parse consumer sampling configuration: {err}"
@@ -1715,6 +2027,22 @@ func NewJSConsumerStoreFailedError(err error, opts ...ErrorOption) *ApiError {
 	}
 }
 
+// NewJSConsumerStreamIdentityMismatchError creates a new JSConsumerStreamIdentityMismatchF error: "consumer's stream identity does not match: {msg}"
+func NewJSConsumerStreamIdentityMismatchError(msg interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSConsumerStreamIdentityMismatchF]
+	args := e.toReplacerArgs([]interface{}{"{msg}", msg})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
 // NewJSConsumerWQConsumerNotDeliverAllError creates a new JSConsumerWQConsumerNotDeliverAllErr error: "consumer must be deliver all on workqueue stream"
 func NewJSConsumerWQConsumerNotDeliverAllError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1901,6 +2229,26 @@ func NewJSMessageSchedulesRollupInvalidError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSMessageSchedulesRollupInvalidErr]
 }
 
+// NewJSMessageSchedulesSchedulerInvalidError creates a new JSMessageSchedulesSchedulerInvalidErr error: "message schedules invalid scheduler"
+func NewJSMessageSchedulesSchedulerInvalidError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageSchedulesSchedulerInvalidErr]
+}
+
+// NewJSMessageSchedulesSourceInvalidError creates a new JSMessageSchedulesSourceInvalidErr error: "message schedules source is invalid"
+func NewJSMessageSchedulesSourceInvalidError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageSchedulesSourceInvalidErr]
+}
+
 // NewJSMessageSchedulesTTLInvalidError creates a new JSMessageSchedulesTTLInvalidErr error: "message schedules invalid per-message TTL"
 func NewJSMessageSchedulesTTLInvalidError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1919,6 +2267,26 @@ func NewJSMessageSchedulesTargetInvalidError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSMessageSchedulesTargetInvalidErr]
+}
+
+// NewJSMessageSchedulesTimeZoneInvalidError creates a new JSMessageSchedulesTimeZoneInvalidErr error: "message schedules time zone is invalid"
+func NewJSMessageSchedulesTimeZoneInvalidError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageSchedulesTimeZoneInvalidErr]
+}
+
+// NewJSMessageSourceHdrNotAllowedError creates a new JSMessageSourceHdrNotAllowedErr error: "message stream source header is not allowed"
+func NewJSMessageSourceHdrNotAllowedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMessageSourceHdrNotAllowedErr]
 }
 
 // NewJSMessageTTLDisabledError creates a new JSMessageTTLDisabledErr error: "per-message TTL is disabled"
@@ -1941,6 +2309,16 @@ func NewJSMessageTTLInvalidError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSMessageTTLInvalidErr]
 }
 
+// NewJSMirrorConsumerRequiresAckFCError creates a new JSMirrorConsumerRequiresAckFCErr error: "stream mirror consumer requires flow control ack policy"
+func NewJSMirrorConsumerRequiresAckFCError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorConsumerRequiresAckFCErr]
+}
+
 // NewJSMirrorConsumerSetupFailedError creates a new JSMirrorConsumerSetupFailedErrF error: "{err}"
 func NewJSMirrorConsumerSetupFailedError(err error, opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -1955,6 +2333,16 @@ func NewJSMirrorConsumerSetupFailedError(err error, opts ...ErrorOption) *ApiErr
 		ErrCode:     e.ErrCode,
 		Description: strings.NewReplacer(args...).Replace(e.Description),
 	}
+}
+
+// NewJSMirrorDurableConsumerCfgInvalidError creates a new JSMirrorDurableConsumerCfgInvalid error: "stream mirror consumer config is invalid"
+func NewJSMirrorDurableConsumerCfgInvalidError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorDurableConsumerCfgInvalid]
 }
 
 // NewJSMirrorInvalidStreamNameError creates a new JSMirrorInvalidStreamName error: "mirrored stream name is invalid"
@@ -2027,6 +2415,26 @@ func NewJSMirrorOverlappingSubjectFiltersError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSMirrorOverlappingSubjectFilters]
+}
+
+// NewJSMirrorWithAtomicPublishError creates a new JSMirrorWithAtomicPublishErr error: "stream mirrors can not also use atomic publishing"
+func NewJSMirrorWithAtomicPublishError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorWithAtomicPublishErr]
+}
+
+// NewJSMirrorWithBatchPublishError creates a new JSMirrorWithBatchPublishErr error: "stream mirrors can not also use batch publishing"
+func NewJSMirrorWithBatchPublishError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSMirrorWithBatchPublishErr]
 }
 
 // NewJSMirrorWithCountersError creates a new JSMirrorWithCountersErr error: "stream mirrors can not also calculate counters"
@@ -2263,6 +2671,26 @@ func NewJSSnapshotDeliverSubjectInvalidError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSSnapshotDeliverSubjectInvalidErr]
 }
 
+// NewJSSourceConsumerFlowControlStalledError creates a new JSSourceConsumerFlowControlStalledErr error: "stream source consumer stalled on flow control"
+func NewJSSourceConsumerFlowControlStalledError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceConsumerFlowControlStalledErr]
+}
+
+// NewJSSourceConsumerRequiresAckFCError creates a new JSSourceConsumerRequiresAckFCErr error: "stream source consumer requires flow control ack policy"
+func NewJSSourceConsumerRequiresAckFCError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceConsumerRequiresAckFCErr]
+}
+
 // NewJSSourceConsumerSetupFailedError creates a new JSSourceConsumerSetupFailedErrF error: "{err}"
 func NewJSSourceConsumerSetupFailedError(err error, opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
@@ -2287,6 +2715,26 @@ func NewJSSourceDuplicateDetectedError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSSourceDuplicateDetected]
+}
+
+// NewJSSourceDurableConsumerCfgInvalidError creates a new JSSourceDurableConsumerCfgInvalid error: "stream source consumer config is invalid"
+func NewJSSourceDurableConsumerCfgInvalidError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceDurableConsumerCfgInvalid]
+}
+
+// NewJSSourceDurableConsumerDuplicateDetectedError creates a new JSSourceDurableConsumerDuplicateDetected error: "duplicate stream source consumer detected"
+func NewJSSourceDurableConsumerDuplicateDetectedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSSourceDurableConsumerDuplicateDetected]
 }
 
 // NewJSSourceInvalidStreamNameError creates a new JSSourceInvalidStreamName error: "sourced stream name is invalid"
@@ -2655,30 +3103,14 @@ func NewJSStreamMoveAndScaleError(opts ...ErrorOption) *ApiError {
 	return ApiErrors[JSStreamMoveAndScaleErr]
 }
 
-// NewJSStreamMoveInProgressError creates a new JSStreamMoveInProgressF error: "stream move already in progress: {msg}"
-func NewJSStreamMoveInProgressError(msg interface{}, opts ...ErrorOption) *ApiError {
+// NewJSStreamMoveInProgressError creates a new JSStreamMoveInProgressErr error: "stream move already in progress"
+func NewJSStreamMoveInProgressError(opts ...ErrorOption) *ApiError {
 	eopts := parseOpts(opts)
 	if ae, ok := eopts.err.(*ApiError); ok {
 		return ae
 	}
 
-	e := ApiErrors[JSStreamMoveInProgressF]
-	args := e.toReplacerArgs([]interface{}{"{msg}", msg})
-	return &ApiError{
-		Code:        e.Code,
-		ErrCode:     e.ErrCode,
-		Description: strings.NewReplacer(args...).Replace(e.Description),
-	}
-}
-
-// NewJSStreamMoveNotInProgressError creates a new JSStreamMoveNotInProgress error: "stream move not in progress"
-func NewJSStreamMoveNotInProgressError(opts ...ErrorOption) *ApiError {
-	eopts := parseOpts(opts)
-	if ae, ok := eopts.err.(*ApiError); ok {
-		return ae
-	}
-
-	return ApiErrors[JSStreamMoveNotInProgress]
+	return ApiErrors[JSStreamMoveInProgressErr]
 }
 
 // NewJSStreamMsgDeleteFailedError creates a new JSStreamMsgDeleteFailedF error: "{err}"
@@ -2787,6 +3219,26 @@ func NewJSStreamPurgeFailedError(err error, opts ...ErrorOption) *ApiError {
 		ErrCode:     e.ErrCode,
 		Description: strings.NewReplacer(args...).Replace(e.Description),
 	}
+}
+
+// NewJSStreamReconfigureInProgressError creates a new JSStreamReconfigureInProgressErr error: "stream reconfiguration already in progress"
+func NewJSStreamReconfigureInProgressError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamReconfigureInProgressErr]
+}
+
+// NewJSStreamReconfigureNotInProgressError creates a new JSStreamReconfigureNotInProgressErr error: "stream reconfiguration not in progress"
+func NewJSStreamReconfigureNotInProgressError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSStreamReconfigureNotInProgressErr]
 }
 
 // NewJSStreamReplicasNotSupportedError creates a new JSStreamReplicasNotSupportedErr error: "replicas > 1 not supported in non-clustered mode"

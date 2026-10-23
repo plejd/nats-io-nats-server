@@ -1,4 +1,4 @@
-// Copyright 2024-2025 The NATS Authors
+// Copyright 2024-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,11 +23,12 @@ package server
 
 import (
 	"encoding"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash"
 	"hash/crc32"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 )
 
@@ -56,7 +57,7 @@ type RCOBStateMachine struct {
 	wg                         sync.WaitGroup
 	leader                     bool
 	proposalSequence           uint64
-	rng                        *rand.Rand
+	rng                        *rand.ChaCha8
 	hash                       hash.Hash
 	blocksApplied              uint64
 	blocksAppliedSinceSnapshot uint64
@@ -126,6 +127,8 @@ func (sm *RCOBStateMachine) applyEntry(ce *CommittedEntry) {
 			sm.applyBlock(entry.Data)
 		} else if entry.Type == EntrySnapshot {
 			sm.loadSnapshot(entry.Data)
+		} else if entry.Type == EntryCatchup {
+			// Ignore.
 		} else {
 			panic(fmt.Sprintf("[%s] unknown entry type: %s", sm.s.Name(), entry.Type))
 		}
@@ -203,7 +206,7 @@ func (sm *RCOBStateMachine) proposeBlock() {
 	sm.proposalSequence += 1
 
 	// Create a block
-	blockSize := 1 + sm.rng.Intn(RCOBOptions.maxBlockSize)
+	blockSize := 1 + rand.New(sm.rng).IntN(RCOBOptions.maxBlockSize)
 	block := RCOBBlock{
 		Proposer:         sm.s.Name(),
 		ProposerSequence: sm.proposalSequence,
@@ -315,7 +318,7 @@ func (sm *RCOBStateMachine) createSnapshot() {
 	}
 
 	// InstallSnapshot is actually "save the snapshot", which is an operation delegated to the node
-	err = sm.n.InstallSnapshot(snapshotData)
+	err = sm.n.InstallSnapshot(snapshotData, false)
 	if err != nil {
 		sm.logDebug("failed to snapshot: %s", err)
 		return
@@ -364,7 +367,9 @@ func newRaftChainStateMachine(s *Server, cfg *RaftConfig, n RaftNode) stateMachi
 	for _, c := range []byte(n.ID()) {
 		seed += int64(c)
 	}
-	rng := rand.New(rand.NewSource(seed))
+	var seedBytes [32]byte
+	binary.LittleEndian.PutUint64(seedBytes[:8], uint64(seed))
+	rng := rand.NewChaCha8(seedBytes)
 
 	// Initialize empty hash block
 	hashBlock := crc32.NewIEEE()

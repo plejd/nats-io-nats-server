@@ -1,4 +1,4 @@
-// Copyright 2024-2025 The NATS Authors
+// Copyright 2024-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import "strconv"
 
 const (
 	// JSApiLevel is the maximum supported JetStream API level for this server.
-	JSApiLevel int = 2
+	JSApiLevel int = 5
 
 	JSRequiredLevelMetadataKey = "_nats.req.level"
 	JSServerVersionMetadataKey = "_nats.ver"
@@ -75,6 +75,16 @@ func setStaticStreamMetadata(cfg *StreamConfig) {
 	// Message scheduling was added in v2.12 and require API level 2.
 	if cfg.AllowMsgSchedules {
 		requires(2)
+	}
+
+	// Async persist mode was added in v2.12 and requires API level 2.
+	if cfg.PersistMode == AsyncPersistMode {
+		requires(2)
+	}
+
+	// Fast batch publishing was added in v2.14 and requires API level 4.
+	if cfg.AllowBatchPublish {
+		requires(4)
 	}
 
 	cfg.Metadata[JSRequiredLevelMetadataKey] = strconv.Itoa(requiredApiLevel)
@@ -151,6 +161,11 @@ func setStaticConsumerMetadata(cfg *ConsumerConfig) {
 
 	if cfg.PriorityPolicy != PriorityNone || cfg.PinnedTTL != 0 || len(cfg.PriorityGroups) > 0 {
 		requires(1)
+	}
+
+	// Added in 2.14
+	if cfg.AckPolicy == AckFlowControl {
+		requires(4)
 	}
 
 	cfg.Metadata[JSRequiredLevelMetadataKey] = strconv.Itoa(requiredApiLevel)

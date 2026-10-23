@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,11 +17,12 @@ package server
 
 import (
 	"bytes"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -439,7 +440,7 @@ func TestNoRaceBinaryStreamSnapshotEncodingBasic(t *testing.T) {
 	mset, err := s.GlobalAccount().lookupStream("TEST")
 	require_NoError(t, err)
 
-	snap, err := mset.store.EncodedStreamState(0)
+	snap, err := mset.store.EncodedStreamState(0, false)
 	require_NoError(t, err)
 
 	// Now decode the snapshot.
@@ -456,7 +457,7 @@ func TestNoRaceFilestoreBinaryStreamSnapshotEncodingLargeGaps(t *testing.T) {
 	storeDir := t.TempDir()
 	fcfg := FileStoreConfig{
 		StoreDir:  storeDir,
-		BlockSize: 512, // Small on purpose to create alot of blks.
+		BlockSize: 512, // Small on purpose to create a lot of blks.
 	}
 	fs, err := newFileStore(fcfg, StreamConfig{Name: "zzz", Subjects: []string{"zzz"}, Storage: FileStorage})
 	require_NoError(t, err)
@@ -473,19 +474,22 @@ func TestNoRaceFilestoreBinaryStreamSnapshotEncodingLargeGaps(t *testing.T) {
 	}
 	fs.StoreMsg(subj, nil, msg, 0)
 
-	snap, err := fs.EncodedStreamState(0)
+	// The tombstones from above will only be cleaned up when syncing blocks.
+	fs.syncBlocks()
+
+	snap, err := fs.EncodedStreamState(0, false)
 	require_NoError(t, err)
-	require_True(t, len(snap) < 512)
+	require_LessThan(t, len(snap), 512)
 
 	// Now decode the snapshot.
 	ss, err := DecodeStreamState(snap)
 	require_NoError(t, err)
 
-	require_True(t, ss.FirstSeq == 1)
-	require_True(t, ss.LastSeq == 20_000)
-	require_True(t, ss.Msgs == 2)
-	require_True(t, len(ss.Deleted) <= 2)
-	require_True(t, ss.Deleted.NumDeleted() == 19_998)
+	require_Equal(t, ss.FirstSeq, 1)
+	require_Equal(t, ss.LastSeq, 20_000)
+	require_Equal(t, ss.Msgs, 2)
+	require_Equal(t, len(ss.Deleted), 1)
+	require_Equal(t, ss.Deleted.NumDeleted(), 19_998)
 }
 
 func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
@@ -544,16 +548,23 @@ func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.waitOnServerCurrent(sr)
 	c.waitOnStreamCurrent(sr, globalAccountName, "TEST")
 
-	mset, err := sr.GlobalAccount().lookupStream("TEST")
-	require_NoError(t, err)
+	// Current can be reported before the leader's snapshot catchup has started, so wait for the state.
+	checkCaughtUp := func(msgs, lseq uint64) {
+		t.Helper()
+		mset, err := sr.GlobalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+			var state StreamState
+			mset.store.FastState(&state)
+			if state.Msgs != msgs || state.FirstSeq != 1 || state.LastSeq != lseq || state.NumDeleted != int(lseq-msgs) {
+				return fmt.Errorf("not caught up: %+v", state)
+			}
+			return nil
+		})
+	}
 
 	// Make sure it's caught up
-	var state StreamState
-	mset.store.FastState(&state)
-	require_Equal(t, state.Msgs, 2)
-	require_Equal(t, state.FirstSeq, 1)
-	require_Equal(t, state.LastSeq, 51_000)
-	require_Equal(t, state.NumDeleted, 51_000-2)
+	checkCaughtUp(2, 51_000)
 
 	sr.Shutdown()
 
@@ -566,15 +577,7 @@ func TestNoRaceJetStreamClusterStreamSnapshotCatchup(t *testing.T) {
 	c.checkClusterFormed()
 	c.waitOnServerCurrent(sr)
 	c.waitOnStreamCurrent(sr, globalAccountName, "TEST")
-
-	mset, err = sr.GlobalAccount().lookupStream("TEST")
-	require_NoError(t, err)
-	mset.store.FastState(&state)
-
-	require_Equal(t, state.Msgs, 3)
-	require_Equal(t, state.FirstSeq, 1)
-	require_Equal(t, state.LastSeq, 51_001)
-	require_Equal(t, state.NumDeleted, 51_001-3)
+	checkCaughtUp(3, 51_001)
 }
 
 func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
@@ -603,7 +606,7 @@ func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
 
 	test := func(t *testing.T, gs StreamStore) {
 		t.Parallel()
-		prand := rand.New(rand.NewSource(seed))
+		prand := rand.New(rand.NewPCG(uint64(seed), 0))
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
 		done := time.NewTimer(10 * time.Second)
@@ -617,7 +620,7 @@ func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
 					continue
 				}
 				start := time.Now()
-				snap, err := gs.EncodedStreamState(0)
+				snap, err := gs.EncodedStreamState(0, false)
 				require_NoError(t, err)
 				elapsed := time.Since(start)
 				// Should take <1ms without race but if CI/CD is slow we will give it a bit of room.
@@ -633,7 +636,7 @@ func TestNoRaceStoreStreamEncoderDecoder(t *testing.T) {
 			case <-done.C:
 				running = false
 			default:
-				key := strconv.Itoa(prand.Intn(256_000))
+				key := strconv.Itoa(prand.IntN(256_000))
 				gs.StoreMsg(key, nil, msg, 0)
 			}
 		}
@@ -691,12 +694,12 @@ func TestNoRaceJetStreamClusterKVWithServerKill(t *testing.T) {
 
 			case <-tk.C:
 				// Pick a random key within the range.
-				k := fmt.Sprintf("key.%d", rand.Intn(numKeys))
+				k := fmt.Sprintf("key.%d", rand.IntN(numKeys))
 				// Attempt to get a key.
 				e, err := kv.Get(k)
 				// If found, attempt to update or delete.
 				if err == nil {
-					if rand.Intn(10) < 3 {
+					if rand.IntN(10) < 3 {
 						kv.Delete(k, nats.LastRevision(e.Revision()))
 					} else {
 						kv.Update(k, nil, e.Revision())
@@ -728,7 +731,7 @@ func TestNoRaceJetStreamClusterKVWithServerKill(t *testing.T) {
 		c.waitOnStreamLeader(globalAccountName, "KV_TEST")
 
 		// Wait for a bit and then start the server again.
-		time.Sleep(time.Duration(rand.Intn(1250)) * time.Millisecond)
+		time.Sleep(time.Duration(rand.IntN(1250)) * time.Millisecond)
 		s = c.restartServer(s)
 		c.waitOnServerCurrent(s)
 		c.waitOnLeader()
@@ -836,6 +839,63 @@ func TestNoRaceWSNoCorruptionWithFrameSizeLimit(t *testing.T) {
 	testWSNoCorruptionWithFrameSizeLimit(t, 50000)
 }
 
+func TestNoRaceWSCompressionGrownBufferRecycling(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true}}
+	c.initClient()
+
+	// Incompressible payload filling the medium pool bucket exactly, so
+	// that the flate output (payload + block overhead) is guaranteed to
+	// outgrow the pooled buffer seeding the compression bytes.Buffer.
+	payload := make([]byte, nbPoolSizeMedium)
+	rnd := uint32(1)
+	for i := range payload {
+		rnd = rnd*1664525 + 1013904223
+		payload[i] = byte(rnd >> 24)
+	}
+
+	// Confirm the payload no longer fits the bucket once compressed.
+	var cb bytes.Buffer
+	cw, _ := flate.NewWriter(&cb, flate.BestSpeed)
+	cw.Write(payload)
+	cw.Flush()
+	if cb.Len() <= nbPoolSizeMedium {
+		t.Fatalf("Expected compressed payload to exceed %v bytes, got %v", nbPoolSizeMedium, cb.Len())
+	}
+
+	nbSlice := make(net.Buffers, 1)
+	collapse := func() {
+		c.mu.Lock()
+		data := nbPoolGet(len(payload))
+		data = append(data, payload...)
+		nbSlice[0] = data
+		c.out.nb = nbSlice
+		c.out.pb = int64(len(payload))
+		c.ws.fs = 0
+
+		// calls c.wsCollapsePtoNB internally.
+		bufs, _ := c.collapsePtoNB()
+		for _, buf := range bufs {
+			nbPoolPut(buf)
+		}
+		c.out.nb = nil
+		c.mu.Unlock()
+	}
+	// Populate the pool and initialize the compressor.
+	for i := 0; i < 10; i++ {
+		collapse()
+	}
+
+	// Growing the bytes.Buffer beyond the seeded pool buffer costs a few
+	// allocations per iteration but the seed itself must be returned to the pool.
+	allocs := testing.AllocsPerRun(500, collapse)
+	if allocs > 3 {
+		t.Fatalf("Too many allocs per iteration (%.1f); the compression seed buffer is likely not recycled", allocs)
+	}
+}
+
 func TestNoRaceJetStreamAPIDispatchQueuePending(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -855,7 +915,7 @@ func TestNoRaceJetStreamAPIDispatchQueuePending(t *testing.T) {
 	// space and wildcards for now does the trick.
 	toks := []string{"foo", "bar", "baz"} // for second token.
 	for i := 1; i <= 500_000; i++ {
-		subj := fmt.Sprintf("foo.%s.%d", toks[rand.Intn(len(toks))], i)
+		subj := fmt.Sprintf("foo.%s.%d", toks[rand.IntN(len(toks))], i)
 		_, err := js.PublishAsync(subj, nil, nats.StallWait(time.Second))
 		require_NoError(t, err)
 	}
@@ -1040,8 +1100,8 @@ func TestNoRaceJetStreamClusterStreamCatchupLargeInteriorDeletes(t *testing.T) {
 
 	// Create 50k messages randomly from 1-100
 	for i := 0; i < 50_000; i++ {
-		subj := fmt.Sprintf("foo.%d", rand.Intn(100)+1)
-		js.PublishAsync(subj, msg)
+		subj := fmt.Sprintf("foo.%d", rand.IntN(100)+1)
+		publishAsync(t, js, subj, msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -1050,7 +1110,7 @@ func TestNoRaceJetStreamClusterStreamCatchupLargeInteriorDeletes(t *testing.T) {
 	}
 	// Now create a large gap.
 	for i := 0; i < 100_000; i++ {
-		js.PublishAsync("foo.2", msg)
+		publishAsync(t, js, "foo.2", msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -1059,8 +1119,8 @@ func TestNoRaceJetStreamClusterStreamCatchupLargeInteriorDeletes(t *testing.T) {
 	}
 	// Do 50k random again at end.
 	for i := 0; i < 50_000; i++ {
-		subj := fmt.Sprintf("foo.%d", rand.Intn(100)+1)
-		js.PublishAsync(subj, msg)
+		subj := fmt.Sprintf("foo.%d", rand.IntN(100)+1)
+		publishAsync(t, js, subj, msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -1130,12 +1190,17 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 
 	var wg sync.WaitGroup
 
+	// Cap inflight consumer create requests to prevent timeout on slower CI machines.
+	inflight := make(chan struct{}, 50)
+
 	for i := 0; i < numConsumers; i++ {
 		cname := fmt.Sprintf("CONS-%d", i+1)
 		consumers = append(consumers, cname)
 		wg.Add(1)
+		inflight <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-inflight }()
 			_, err := js.PullSubscribe("foo.>", cname, nats.BindStream("TEST"))
 			require_NoError(t, err)
 		}()
@@ -1158,12 +1223,17 @@ func TestNoRaceJetStreamClusterBadRestartsWithHealthzPolling(t *testing.T) {
 	numStreams := 200
 	streams := make([]string, 0, numStreams)
 
+	// Cap number of inflight stream request creates.
+	sinflight := make(chan struct{}, 25)
+
 	for i := 0; i < numStreams; i++ {
 		sname := fmt.Sprintf("TEST-%d", i+1)
 		streams = append(streams, sname)
 		wg.Add(1)
+		sinflight <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer func() { <-sinflight }()
 			_, err := js.AddStream(&nats.StreamConfig{Name: sname, Replicas: 3})
 			require_NoError(t, err)
 		}()
@@ -1249,7 +1319,7 @@ func TestNoRaceJetStreamKVReplaceWithServerRestart(t *testing.T) {
 		const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 		b := make([]byte, n)
 		for i := range b {
-			b[i] = letterBytes[rand.Intn(len(letterBytes))]
+			b[i] = letterBytes[rand.IntN(len(letterBytes))]
 		}
 		return b
 	}
@@ -1370,6 +1440,12 @@ func TestNoRaceMemStoreCompactPerformance(t *testing.T) {
 }
 
 func TestNoRaceJetStreamSnapshotsWithSlowAckDontSlowConsumer(t *testing.T) {
+	// Test takes less time this way.
+	snapshotAckTimeout = 500 * time.Millisecond
+	t.Cleanup(func() {
+		snapshotAckTimeout = defaultSnapshotAckTimeout
+	})
+
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
@@ -1426,7 +1502,7 @@ func TestNoRaceJetStreamSnapshotsWithSlowAckDontSlowConsumer(t *testing.T) {
 		require_Equal(t, msg.Header.Get("Description"), "No Flow Response")
 	case <-ech:
 		t.Fatalf("Got disconnected: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(snapshotAckTimeout * 2):
 		t.Fatalf("Should have received EOF with error status")
 	}
 }
@@ -1506,7 +1582,7 @@ func TestNoRaceJetStreamWQSkippedMsgsOnScaleUp(t *testing.T) {
 		for {
 			select {
 			case <-st.C:
-				subj := publishSubjects[rand.Intn(len(publishSubjects))]
+				subj := publishSubjects[rand.IntN(len(publishSubjects))]
 				_, err = js.Publish(subj, msg)
 				require_NoError(t, err)
 			case <-pdone:
@@ -1541,11 +1617,11 @@ func TestNoRaceJetStreamWQSkippedMsgsOnScaleUp(t *testing.T) {
 				}
 				require_Equal(t, len(msgs), 1)
 				m := msgs[0]
-				if rand.Intn(10) == 1 {
+				if rand.IntN(10) == 1 {
 					m.Nak()
 				} else {
 					// Wait up to 20ms to ack.
-					time.Sleep(time.Duration(rand.Intn(20)) * time.Millisecond)
+					time.Sleep(time.Duration(rand.IntN(20)) * time.Millisecond)
 					// This could fail and that is ok, system should recover due to low ack wait.
 					m.Ack()
 				}
@@ -2083,7 +2159,7 @@ func TestNoRaceFileStoreWriteFullStateUniqueSubjects(t *testing.T) {
 			partB := nuid.Next()
 			for k := 0; k < 500; k++ {
 				partC := nuid.Next()
-				partD := labels[rand.Intn(len(labels)-1)]
+				partD := labels[rand.IntN(len(labels)-1)]
 				subject := fmt.Sprintf("records.%s.%s.%s.%s.%s", partA, partB, partC, partD, nuid.Next())
 				start := time.Now()
 				fs.StoreMsg(subject, nil, msg, 0)
@@ -2294,7 +2370,7 @@ func TestNoRaceJetStreamClusterMemoryStreamLastSequenceResetAfterRestart(t *test
 			require_NoError(t, err)
 			node := mset.raftNode()
 			require_NotNil(t, node)
-			node.InstallSnapshot(mset.stateSnapshot())
+			node.InstallSnapshot(mset.stateSnapshot(), false)
 		}
 	}
 
@@ -2444,10 +2520,10 @@ func TestNoRaceJetStreamClusterMirrorSkipSequencingBug(t *testing.T) {
 	// via the max msgs per limit.
 	for i := 0; i < 500_000; i++ {
 		subj := fmt.Sprintf("foo.%d", i)
-		js.PublishAsync(subj, nil)
+		publishAsync(t, js, subj, nil)
 		// Create sequence holes every 100k.
 		if i%100_000 == 0 {
-			js.PublishAsync(subj, nil)
+			publishAsync(t, js, subj, nil)
 		}
 	}
 	select {
@@ -2460,7 +2536,7 @@ func TestNoRaceJetStreamClusterMirrorSkipSequencingBug(t *testing.T) {
 		si, err := js.StreamInfo("M")
 		require_NoError(t, err)
 		if si.State.Msgs != 500_000 {
-			return fmt.Errorf("Expected 1M msgs, got state: %+v", si.State)
+			return fmt.Errorf("Expected 500k msgs, got state: %+v", si.State)
 		}
 		return nil
 	})
@@ -2669,11 +2745,11 @@ func TestNoRaceJetStreamClusterCheckInterestStatePerformanceWQ(t *testing.T) {
 	// Load up a bunch of messages for three different subjects.
 	msg := bytes.Repeat([]byte("Z"), 4096)
 	for i := 0; i < 100_000; i++ {
-		js.PublishAsync("foo.foo", msg)
+		publishAsync(t, js, "foo.foo", msg)
 	}
 	for i := 0; i < 5_000; i++ {
-		js.PublishAsync("foo.bar", msg)
-		js.PublishAsync("foo.baz", msg)
+		publishAsync(t, js, "foo.bar", msg)
+		publishAsync(t, js, "foo.baz", msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -2730,14 +2806,20 @@ func TestNoRaceJetStreamClusterCheckInterestStatePerformanceWQ(t *testing.T) {
 	// Was > 30 ms before fix for comparison, M2 macbook air.
 	require_LessThan(t, elapsed, 5*time.Millisecond)
 
-	// Make sure we set the chkflr correctly. The chkflr should be equal to asflr+1.
+	// Make sure we set the chkflr correctly.
+	// The chkflr should be equal to asflr+1 (unless the next message matching the filter is further ahead).
 	// Otherwise, if chkflr would be set higher a subsequent call to checkInterestState will be ineffective.
 	requireFloorsEqual := func(o *consumer) {
 		t.Helper()
 		require_True(t, o != nil)
 		o.mu.RLock()
 		defer o.mu.RUnlock()
-		require_Equal(t, o.chkflr, o.asflr+1)
+		_, seq, err := mset.store.LoadNextMsg(o.cfg.FilterSubject, false, o.asflr+1, nil)
+		if err == ErrStoreEOF {
+			seq++
+		}
+		require_True(t, o.asflr+1 <= seq)
+		require_Equal(t, o.chkflr, seq)
 	}
 
 	requireFloorsEqual(mset.lookupConsumer("A"))
@@ -2785,11 +2867,11 @@ func TestNoRaceJetStreamClusterCheckInterestStatePerformanceInterest(t *testing.
 	// Load up a bunch of messages for three different subjects.
 	msg := bytes.Repeat([]byte("Z"), 4096)
 	for i := 0; i < 90_000; i++ {
-		js.PublishAsync("foo.foo", msg)
+		publishAsync(t, js, "foo.foo", msg)
 	}
 	for i := 0; i < 5_000; i++ {
-		js.PublishAsync("foo.bar", msg)
-		js.PublishAsync("foo.baz", msg)
+		publishAsync(t, js, "foo.bar", msg)
+		publishAsync(t, js, "foo.baz", msg)
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -2889,9 +2971,9 @@ func TestNoRaceJetStreamClusterLargeMetaSnapshotTiming(t *testing.T) {
 	n := js.getMetaGroup()
 	// Now let's see how long it takes to create a meta snapshot and how big it is.
 	start := time.Now()
-	snap, err := js.metaSnapshot()
+	snap, _, _, err := js.metaSnapshot()
 	require_NoError(t, err)
-	require_NoError(t, n.InstallSnapshot(snap))
+	require_NoError(t, n.InstallSnapshot(snap, false))
 	t.Logf("Took %v to snap meta with size of %v\n", time.Since(start), friendlyBytes(len(snap)))
 }
 
@@ -2910,22 +2992,37 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 	msg := []byte("Hello")
 
 	for _, store := range []StreamStore{fs, ms} {
-		store.StoreMsg("foo.A", nil, msg, 0)
+		_, _, err = store.StoreMsg("foo.A", nil, msg, 0)
+		require_NoError(t, err)
 		for i := 0; i < 1_000_000; i++ {
-			store.StoreMsg("foo.B", nil, msg, 0)
+			_, _, err = store.StoreMsg("foo.B", nil, msg, 0)
+			require_NoError(t, err)
 		}
-		store.StoreMsg("foo.C", nil, msg, 0)
+		_, _, err = store.StoreMsg("foo.C", nil, msg, 0)
+		require_NoError(t, err)
 
 		var ss StreamState
 		store.FastState(&ss)
 		require_Equal(t, ss.Msgs, 1_000_002)
 
 		// Create a bunch of interior deletes.
-		p, err := store.PurgeEx("foo.B", 1, 0)
+		p, err := store.PurgeEx("foo.B", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, 1_000_000)
 
+		// Preload the caches so this test only measures the reverse walk.
+		preloadCaches := func() {
+			if fs, ok := store.(*fileStore); ok {
+				fs.mu.Lock()
+				defer fs.mu.Unlock()
+				for _, mb := range fs.blks {
+					require_NoError(t, mb.loadMsgs())
+				}
+			}
+		}
+
 		// Now simulate a walk backwards as we currently do when searching for starting sequence numbers in sourced streams.
+		preloadCaches()
 		start := time.Now()
 		var smv StoreMsg
 		for seq := ss.LastSeq; seq > 0; seq-- {
@@ -2938,10 +3035,11 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 		elapsed := time.Since(start)
 
 		// Now use the optimized load prev.
+		preloadCaches()
 		seq, seen := ss.LastSeq, 0
 		start = time.Now()
 		for {
-			sm, err := store.LoadPrevMsg(seq, &smv)
+			sm, _, err := store.LoadPrevMsg(_EMPTY_, false, seq, &smv)
 			if err == ErrStoreEOF {
 				break
 			}
@@ -2954,10 +3052,10 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 
 		switch store.(type) {
 		case *memStore:
-			require_True(t, elapsedNew < elapsed)
+			require_LessThan(t, elapsedNew, elapsed)
 		case *fileStore:
-			// Bigger gains for filestore, 10x
-			require_True(t, elapsedNew*10 < elapsed)
+			// Bigger gains for filestore.
+			require_LessThan(t, elapsedNew*10, elapsed)
 		}
 	}
 }
@@ -3286,7 +3384,7 @@ func TestNoRaceJetStreamClusterConsumerDeleteInterestPolicyPerf(t *testing.T) {
 		t.Fatalf("Deleting AckNone consumer took too long: %v", elapsed)
 	}
 
-	expectedStreamMsgs(499_995)
+	expectedStreamMsgs(499_950)
 
 	// Now do AckAll
 	start = time.Now()
@@ -3296,7 +3394,7 @@ func TestNoRaceJetStreamClusterConsumerDeleteInterestPolicyPerf(t *testing.T) {
 		t.Fatalf("Deleting AckAll consumer took too long: %v", elapsed)
 	}
 
-	expectedStreamMsgs(499_995)
+	expectedStreamMsgs(499_950)
 
 	// Now do AckExplicit
 	start = time.Now()
@@ -3393,7 +3491,7 @@ func TestNoRaceJetStreamClusterConsumerDeleteInterestPolicyUniqueFiltersPerf(t *
 		t.Fatalf("Deleting AckNone consumer took too long: %v", elapsed)
 	}
 
-	expectedStreamMsgs(499_900)
+	expectedStreamMsgs(499_800)
 
 	start = time.Now()
 	err = js.DeleteConsumer("TEST", "C0")
@@ -3477,5 +3575,352 @@ func TestNoRaceAccessTimeLeakCheck(t *testing.T) {
 			return fmt.Errorf("expected %d, got %d", ngrp, ngra)
 		}
 		return nil
+	})
+}
+
+func TestNoRaceQuickMultipleConfigReloadRemoteLeafNoDuplicate(t *testing.T) {
+	// This test is to demonstrate that if we perform quicj disable/enable,
+	// or remove/add of remote leafnodes, we don't end up with multiple
+	// "connect to remote" go routines for the same remote, leading to duplicate
+	// remote leafnodes.
+
+	conf1 := createConfFile(t, []byte(`
+		port: -1
+		server_name: "A"
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	s1, o1 := RunServerWithConfig(conf1)
+	defer s1.Shutdown()
+	l := &captureErrorLogger{errCh: make(chan string, 100)}
+	s1.SetLogger(l, false, false)
+
+	tmpl2 := `
+		port: -1
+		server_name: "B"
+		leafnodes {
+			reconnect_interval: "50ms"
+			remotes [
+				%s
+			]
+		}
+	`
+
+	configWithAdded := fmt.Appendf(nil, tmpl2,
+		fmt.Sprintf(`{url: "nats://127.0.0.1:%d"}`, o1.LeafNode.Port))
+	configWithRemoved := fmt.Appendf(nil, tmpl2, _EMPTY_)
+	configWithDisabled := fmt.Appendf(nil, tmpl2,
+		fmt.Sprintf(`{url: "nats://127.0.0.1:%d", disabled: true}`, o1.LeafNode.Port))
+	configWithEnabled := fmt.Appendf(nil, tmpl2,
+		fmt.Sprintf(`{url: "nats://127.0.0.1:%d", disabled: false}`, o1.LeafNode.Port))
+
+	conf2 := createConfFile(t, configWithEnabled)
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnectedCount(t, s2, 1)
+
+	for _, test := range []struct {
+		name     string
+		disabled bool
+	}{
+		{"disabled_enabled", true},
+		{"removed_added", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var disabledOrRemoved bool
+			// We pick a number that will end the loop with enabled/added remote.
+			for range 20 {
+				disabledOrRemoved = !disabledOrRemoved
+				var config []byte
+				if test.disabled {
+					if disabledOrRemoved {
+						config = configWithDisabled
+					} else {
+						config = configWithEnabled
+					}
+				} else {
+					if disabledOrRemoved {
+						config = configWithRemoved
+					} else {
+						config = configWithAdded
+					}
+				}
+				err := os.WriteFile(conf2, config, 0666)
+				require_NoError(t, err)
+				deadline := time.Now().Add(1500 * time.Millisecond)
+				for time.Now().Before(deadline) {
+					err = s2.Reload()
+					if err == nil || !strings.Contains(err.Error(), "try again") {
+						break
+					}
+				}
+				require_NoError(t, err)
+			}
+			checkLeafNodeConnectedCount(t, s2, 1)
+
+			for {
+				select {
+				case errTxt := <-l.errCh:
+					if strings.Contains(errTxt, DuplicateRemoteLeafnodeConnection.String()) {
+						t.Fatalf("Duplicates detected: %s", errTxt)
+					}
+				default:
+					// No error, all ok!
+					return
+				}
+			}
+		})
+	}
+}
+
+// This test observes buffers being returned to the block buffer sync.Pools.
+// Under the race detector sync.Pool randomly drops puts by design, so it
+// cannot run with -race.
+func TestNoRaceFileStoreWeakCacheGCRecyclesBuf(t *testing.T) {
+	// Run everything on a single P so all sync.Pool puts/gets use the same
+	// P-local pool: buffers recycled by the GC cleanup goroutine would
+	// otherwise often land in another P's private slot, which Get on this
+	// goroutine can never steal from and the test couldn't observe them.
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	// All cache buffers in this test come from the tiny block pool, identify
+	// them by their backing array so we can spot them in the pool.
+	bufArr := func(buf []byte) *[defaultTinyBlockSize]byte {
+		return (*[defaultTinyBlockSize]byte)(buf[0:defaultTinyBlockSize])
+	}
+	// Wait for the GC cleanup to recycle the buffer back into the pool.
+	// GC and polling must be interleaved carefully: every GC cycle also
+	// drains the sync.Pools, so polling Get while triggering GCs could
+	// evict the recycled buffer before we get a chance to observe it.
+	expectRecycled := func(t *testing.T, arr *[defaultTinyBlockSize]byte) {
+		t.Helper()
+		for attempts := 0; attempts < 10; attempts++ {
+			runtime.GC()
+			// Poll without triggering more GCs so the pool isn't drained
+			// while we look for the buffer.
+			for range 20 {
+				if blkPoolTiny.Get().(*[defaultTinyBlockSize]byte) == arr {
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		t.Fatalf("buffer was not recycled into the pool")
+	}
+	// Ensure the buffer does not (re)appear in the pool through a GC cleanup.
+	expectNotRecycled := func(t *testing.T, arr *[defaultTinyBlockSize]byte) {
+		t.Helper()
+		for attempts := 0; attempts < 3; attempts++ {
+			runtime.GC()
+			// Give a (faulty) cleanup time to run, then poll without
+			// triggering more GCs so we would reliably see its recycle.
+			time.Sleep(20 * time.Millisecond)
+			for range 20 {
+				if blkPoolTiny.Get().(*[defaultTinyBlockSize]byte) == arr {
+					t.Fatalf("buffer was recycled into the pool, but should not have been")
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+	}
+
+	newTestStore := func(t *testing.T) *msgBlock {
+		t.Helper()
+		fs, err := newFileStore(
+			FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 8192},
+			StreamConfig{Name: "zzz", Storage: FileStorage, Subjects: []string{"foo"}},
+		)
+		require_NoError(t, err)
+		t.Cleanup(func() { fs.Stop() })
+
+		for range 4 {
+			_, _, err = fs.StoreMsg("foo", nil, []byte("hello"), 0)
+			require_NoError(t, err)
+		}
+		require_NoError(t, fs.FlushAllPending())
+
+		fs.mu.Lock()
+		mb := fs.lmb
+		fs.mu.Unlock()
+		return mb
+	}
+
+	t.Run("recycledOnGC", func(t *testing.T) {
+		arr := func() *[defaultTinyBlockSize]byte {
+			c := &cache{buf: getMsgBlockBuf(1)}
+			c.registerRecycle()
+			require_True(t, c.clean != (runtime.Cleanup{}))
+			return bufArr(c.buf)
+		}()
+		// The cache is unreachable now, GC should recycle its buffer.
+		expectRecycled(t, arr)
+	})
+
+	t.Run("stopRecycle", func(t *testing.T) {
+		arr := func() *[defaultTinyBlockSize]byte {
+			c := &cache{buf: getMsgBlockBuf(1)}
+			c.registerRecycle()
+			c.stopRecycle()
+			require_True(t, c.clean == (runtime.Cleanup{}))
+			return bufArr(c.buf)
+		}()
+		expectNotRecycled(t, arr)
+	})
+
+	t.Run("registerRecycleTwice", func(t *testing.T) {
+		arr := func() *[defaultTinyBlockSize]byte {
+			c := &cache{buf: getMsgBlockBuf(1)}
+			// Registering again must cancel the previous registration,
+			// otherwise the buffer would be recycled twice.
+			c.registerRecycle()
+			c.registerRecycle()
+			return bufArr(c.buf)
+		}()
+		expectRecycled(t, arr)
+		expectNotRecycled(t, arr)
+	})
+
+	t.Run("noRecycleNRA", func(t *testing.T) {
+		arr := func() *[defaultTinyBlockSize]byte {
+			c := &cache{buf: getMsgBlockBuf(1), nra: true}
+			c.registerRecycle()
+			require_True(t, c.clean == (runtime.Cleanup{}))
+			return bufArr(c.buf)
+		}()
+		expectNotRecycled(t, arr)
+	})
+
+	t.Run("noRecycleEmptyBuf", func(t *testing.T) {
+		c := &cache{}
+		c.registerRecycle()
+		require_True(t, c.clean == (runtime.Cleanup{}))
+		// Stopping without a registration, or twice, must not panic.
+		c.stopRecycle()
+		c.stopRecycle()
+		// Neither must registering on a nil cache.
+		(*cache)(nil).registerRecycle()
+	})
+
+	t.Run("weakWriteCacheGC", func(t *testing.T) {
+		mb := newTestStore(t)
+		arr := func() *[defaultTinyBlockSize]byte {
+			mb.mu.Lock()
+			defer mb.mu.Unlock()
+			// The write path registered the recycle cleanup when it grew
+			// the write cache buffer from the pool.
+			require_NotNil(t, mb.cache)
+			require_True(t, mb.cache.clean != (runtime.Cleanup{}))
+			require_Equal(t, cap(mb.cache.buf), defaultTinyBlockSize)
+			arr := bufArr(mb.cache.buf)
+			// Drop the strong references so only the weak pointer remains.
+			mb.finishedWithCache()
+			require_True(t, mb.cache == nil)
+			mb.ecache.Weaken()
+			require_NotNil(t, mb.ecache.Value())
+			return arr
+		}()
+
+		// GC collects the weakly referenced cache and recycles its buffer.
+		expectRecycled(t, arr)
+		mb.mu.Lock()
+		defer mb.mu.Unlock()
+		require_True(t, mb.ecache.Value() == nil)
+	})
+
+	t.Run("weakLoadedCacheGC", func(t *testing.T) {
+		mb := newTestStore(t)
+		arr := func() *[defaultTinyBlockSize]byte {
+			mb.mu.Lock()
+			defer mb.mu.Unlock()
+			// Reload the block from disk so indexCacheBuf registers the cleanup.
+			mb.clearCache()
+			require_True(t, mb.cache == nil)
+			require_NoError(t, mb.loadMsgsWithLock())
+			require_NotNil(t, mb.cache)
+			require_True(t, mb.cache.clean != (runtime.Cleanup{}))
+			require_Equal(t, cap(mb.cache.buf), defaultTinyBlockSize)
+			arr := bufArr(mb.cache.buf)
+			mb.finishedWithCache()
+			require_True(t, mb.cache == nil)
+			mb.ecache.Weaken()
+			require_NotNil(t, mb.ecache.Value())
+			return arr
+		}()
+
+		expectRecycled(t, arr)
+		mb.mu.Lock()
+		defer mb.mu.Unlock()
+		require_True(t, mb.ecache.Value() == nil)
+	})
+
+	t.Run("clearCacheNoDoubleRecycle", func(t *testing.T) {
+		mb := newTestStore(t)
+		arr := func() *[defaultTinyBlockSize]byte {
+			mb.mu.Lock()
+			defer mb.mu.Unlock()
+			require_NotNil(t, mb.cache)
+			require_Equal(t, cap(mb.cache.buf), defaultTinyBlockSize)
+			arr := bufArr(mb.cache.buf)
+			mb.clearCache()
+			require_True(t, mb.cache == nil)
+			require_True(t, mb.ecache.Value() == nil)
+			return arr
+		}()
+
+		// clearCache recycled the buffer into the pool explicitly once...
+		expectRecycled(t, arr)
+		// ...and GC of the disused cache must not recycle it a second time.
+		expectNotRecycled(t, arr)
+	})
+
+	t.Run("writeCacheHandoffNoRecycle", func(t *testing.T) {
+		mb := newTestStore(t)
+		arr, buf := func() (*[defaultTinyBlockSize]byte, []byte) {
+			mb.mu.Lock()
+			defer mb.mu.Unlock()
+			require_NotNil(t, mb.cache)
+			require_Equal(t, cap(mb.cache.buf), defaultTinyBlockSize)
+			arr := bufArr(mb.cache.buf)
+			// Pretend the block was never loaded for reads, so the write cache
+			// buffer is handed off for reuse by the next write block.
+			mb.llts = 0
+			buf := mb.tryExpireWriteCache()
+			require_True(t, buf != nil)
+			require_True(t, bufArr(buf) == arr)
+			// Drop any remaining references to the old cache object.
+			mb.cache = nil
+			mb.ecache.Set(nil)
+			return arr, buf
+		}()
+
+		// The handed-off buffer is still in use, so GC of the old cache
+		// object must not recycle it into the pool.
+		expectNotRecycled(t, arr)
+		runtime.KeepAlive(buf)
+	})
+
+	t.Run("expiredWriteCacheNoHandoffRecycles", func(t *testing.T) {
+		mb := newTestStore(t)
+		arr := func() *[defaultTinyBlockSize]byte {
+			mb.mu.Lock()
+			defer mb.mu.Unlock()
+			require_NotNil(t, mb.cache)
+			require_Equal(t, cap(mb.cache.buf), defaultTinyBlockSize)
+			arr := bufArr(mb.cache.buf)
+			// Pretend the block was read, but long ago. The cache will
+			// expire, but the stale read blocks the buffer handoff.
+			mb.llts = 1
+			buf := mb.tryExpireWriteCache()
+			require_True(t, buf == nil)
+			require_True(t, mb.cache == nil)
+			return arr
+		}()
+
+		// The buffer was recycled into the pool explicitly once...
+		expectRecycled(t, arr)
+		// ...and GC of the disused cache must not recycle it a second time.
+		expectNotRecycled(t, arr)
 	})
 }

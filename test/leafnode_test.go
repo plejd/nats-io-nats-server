@@ -1,4 +1,4 @@
-// Copyright 2019-2025 The NATS Authors
+// Copyright 2019-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,10 +19,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -833,7 +834,7 @@ func TestLeafNodeGatewaySendsSystemEvent(t *testing.T) {
 	defer lc.Close()
 
 	// This is for our global responses since we are setting up GWs above.
-	leafSend, leafExpect := setupLeaf(t, lc, 8)
+	leafSend, leafExpect := setupLeaf(t, lc, 7)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -878,14 +879,14 @@ func TestLeafNodeGatewayInterestPropagation(t *testing.T) {
 	buf = infoStartRe.ReplaceAll(buf, []byte(nil))
 
 	foundFoo := false
-	for count := 0; count < 10; {
+	for count := 0; count < 9; {
 		// skip first time if we still have data (buf from above may already have some left)
 		if count != 0 || len(buf) == 0 {
 			buf = append(buf, leafExpect(anyRe)...)
 		}
 		count += len(lsubRe.FindAllSubmatch(buf, -1))
-		if count > 10 {
-			t.Fatalf("Expected %v matches, got %v (buf=%s)", 10, count, buf)
+		if count > 9 {
+			t.Fatalf("Expected %v matches, got %v (buf=%s)", 9, count, buf)
 		}
 		if strings.Contains(string(buf), "foo") {
 			foundFoo = true
@@ -937,7 +938,7 @@ func TestLeafNodeWithRouteAndGateway(t *testing.T) {
 	defer lc.Close()
 
 	// This is for our global responses since we are setting up GWs above.
-	leafSend, leafExpect := setupLeaf(t, lc, 8)
+	leafSend, leafExpect := setupLeaf(t, lc, 7)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -996,7 +997,7 @@ func TestLeafNodeWithGatewaysAndStaggeredStart(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupLeaf(t, lc, 8)
+	leafSend, leafExpect := setupLeaf(t, lc, 7)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -1036,7 +1037,7 @@ func TestLeafNodeWithGatewaysServerRestart(t *testing.T) {
 	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	leafSend, leafExpect := setupLeaf(t, lc, 8)
+	leafSend, leafExpect := setupLeaf(t, lc, 7)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -1070,7 +1071,7 @@ func TestLeafNodeWithGatewaysServerRestart(t *testing.T) {
 	lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
 
-	_, leafExpect = setupLeaf(t, lc, 8)
+	_, leafExpect = setupLeaf(t, lc, 7)
 
 	// Now wait on GW solicit to fire
 	time.Sleep(500 * time.Millisecond)
@@ -1579,7 +1580,7 @@ func TestLeafNodeOperatorAndPermissions(t *testing.T) {
 	defer os.Remove(conf)
 	defer s.Shutdown()
 
-	acc, akp := createAccount(t, s)
+	_, akp := createAccount(t, s)
 	kp, _ := nkeys.CreateUser()
 	pub, _ := kp.PublicKey()
 
@@ -1669,8 +1670,22 @@ func TestLeafNodeOperatorAndPermissions(t *testing.T) {
 	}
 	leafnc.Flush()
 
-	// Make sure the interest on "bar" from "sl" server makes it to the "s" server.
-	checkSubInterest(t, s, acc.GetName(), "bar", time.Second)
+	// Make sure the interest on "bar" and "*" from "sl" server makes it to the "s" server.
+	// Can't use checkSubInterest since the local sub on "*" on "s" already matches.
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		leafz, err := s.Leafz(&server.LeafzOptions{Subscriptions: true})
+		if err != nil {
+			return err
+		}
+		if len(leafz.Leafs) != 1 {
+			return fmt.Errorf("expected 1 leaf, got %d", len(leafz.Leafs))
+		}
+		subs := leafz.Leafs[0].Subs
+		if !slices.Contains(subs, "bar") || !slices.Contains(subs, "*") {
+			return fmt.Errorf("leaf interest not registered yet: %v", subs)
+		}
+		return nil
+	})
 	// Check for local interest too.
 	checkSubInterest(t, sl, "$G", "bar", time.Second)
 
@@ -2617,7 +2632,7 @@ func TestLeafNodeSwitchGatewayToInterestModeOnly(t *testing.T) {
 	defer lc.Close()
 
 	// This is for our global responses since we are setting up GWs above.
-	leafSend, leafExpect := setupLeaf(t, lc, 8)
+	leafSend, leafExpect := setupLeaf(t, lc, 7)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 }
@@ -2898,7 +2913,7 @@ func TestLeafNodeDistributedQueueAcrossGWs(t *testing.T) {
 	// Create queue subscribers
 	createQS := func(c *cluster) *nats.Conn {
 		t.Helper()
-		opts := c.opts[rand.Intn(len(c.opts))]
+		opts := c.opts[rand.IntN(len(c.opts))]
 		url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
 		nc, err := nats.Connect(url)
 		if err != nil {
@@ -2939,7 +2954,7 @@ func TestLeafNodeDistributedQueueAcrossGWs(t *testing.T) {
 	checkClientDQ := func(c *cluster, nreqs int) {
 		t.Helper()
 		// Pick one at random.
-		opts := c.opts[rand.Intn(len(c.opts))]
+		opts := c.opts[rand.IntN(len(c.opts))]
 		url := fmt.Sprintf("nats://dlc:pass@%s:%d", opts.Host, opts.Port)
 		connectAndRequest(url, c.name, nreqs)
 	}
@@ -2952,7 +2967,7 @@ func TestLeafNodeDistributedQueueAcrossGWs(t *testing.T) {
 	createLNS := func(c *cluster) (*server.Server, *server.Options) {
 		t.Helper()
 		// Pick one at random.
-		copts := c.opts[rand.Intn(len(c.servers))]
+		copts := c.opts[rand.IntN(len(c.servers))]
 		s, opts := runSolicitLeafServerToURL(fmt.Sprintf("nats-leaf://dlc:pass@%s:%d", copts.LeafNode.Host, copts.LeafNode.Port))
 		checkLeafNodeConnected(t, s)
 		return s, opts
@@ -2984,7 +2999,7 @@ func TestLeafNodeDistributedQueueEvenly(t *testing.T) {
 	// Create queue subscribers
 	createQS := func(c *cluster) *nats.Conn {
 		t.Helper()
-		opts := c.opts[rand.Intn(len(c.opts))]
+		opts := c.opts[rand.IntN(len(c.opts))]
 		url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
 		nc, err := nats.Connect(url)
 		if err != nil {
@@ -3032,7 +3047,7 @@ func TestLeafNodeDistributedQueueEvenly(t *testing.T) {
 	createLNS := func(c *cluster) (*server.Server, *server.Options) {
 		t.Helper()
 		// Pick one at random.
-		copts := c.opts[rand.Intn(len(c.servers))]
+		copts := c.opts[rand.IntN(len(c.servers))]
 		s, opts := runSolicitLeafServerToURL(fmt.Sprintf("nats-leaf://dlc:pass@%s:%d", copts.LeafNode.Host, copts.LeafNode.Port))
 		checkLeafNodeConnected(t, s)
 		return s, opts
@@ -3231,7 +3246,7 @@ func runSolicitLeafCluster(t *testing.T, clusterName string, d1, d2 *cluster) *c
 	c := &cluster{servers: make([]*server.Server, 0, 2), opts: make([]*server.Options, 0, 2), name: clusterName}
 
 	// Who we will solicit for server 1
-	ci := rand.Intn(len(d1.opts))
+	ci := rand.IntN(len(d1.opts))
 	opts := d1.opts[ci]
 	surl := fmt.Sprintf("nats-leaf://%s:%d", opts.LeafNode.Host, opts.LeafNode.Port)
 
@@ -3254,7 +3269,7 @@ func runSolicitLeafCluster(t *testing.T, clusterName string, d1, d2 *cluster) *c
 	curl, _ := url.Parse(routeAddr)
 
 	// Who we will solicit for server 2
-	ci = rand.Intn(len(d2.opts))
+	ci = rand.IntN(len(d2.opts))
 	opts = d2.opts[ci]
 	surl = fmt.Sprintf("nats-leaf://%s:%d", opts.LeafNode.Host, opts.LeafNode.Port)
 
@@ -3288,7 +3303,7 @@ func runSolicitLeafCluster(t *testing.T, clusterName string, d1, d2 *cluster) *c
 
 func clientForCluster(t *testing.T, c *cluster) *nats.Conn {
 	t.Helper()
-	opts := c.opts[rand.Intn(len(c.opts))]
+	opts := c.opts[rand.IntN(len(c.opts))]
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	nc, err := nats.Connect(url)
 	if err != nil {

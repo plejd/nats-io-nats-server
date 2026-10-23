@@ -1,4 +1,4 @@
-// Copyright 2024-2025 The NATS Authors
+// Copyright 2024-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,16 @@ func TestJetStreamSetStaticStreamMetadata(t *testing.T) {
 			desc:             "AllowMsgSchedules",
 			cfg:              &StreamConfig{AllowMsgSchedules: true},
 			expectedMetadata: metadataAtLevel("2"),
+		},
+		{
+			desc:             "AsyncPersistMode",
+			cfg:              &StreamConfig{PersistMode: AsyncPersistMode},
+			expectedMetadata: metadataAtLevel("2"),
+		},
+		{
+			desc:             "AllowBatchPublish",
+			cfg:              &StreamConfig{AllowBatchPublish: true},
+			expectedMetadata: metadataAtLevel("4"),
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
@@ -242,6 +253,11 @@ func TestJetStreamSetStaticConsumerMetadata(t *testing.T) {
 			desc:             "Pinned",
 			cfg:              &ConsumerConfig{PriorityPolicy: PriorityPinnedClient, PriorityGroups: []string{"a"}},
 			expectedMetadata: metadataAtLevel("1"),
+		},
+		{
+			desc:             "AckFlowControl",
+			cfg:              &ConsumerConfig{AckPolicy: AckFlowControl},
+			expectedMetadata: metadataAtLevel("4"),
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
@@ -653,7 +669,14 @@ func TestJetStreamApiErrorOnRequiredApiLevel(t *testing.T) {
 			var resp ApiResponse
 			require_NoError(t, json.Unmarshal(msg.Data, &resp))
 			require_True(t, resp.Error != nil)
-			require_Error(t, resp.Error, NewJSRequiredApiLevelError())
+			// Peer remove, stepdown or cancel move is not supported if not clustered.
+			if strings.Contains(apiSubject, ".STEPDOWN.") ||
+				strings.Contains(apiSubject, ".PEER.") ||
+				strings.Contains(apiSubject, ".CANCEL_MOVE.") {
+				require_Error(t, resp.Error, NewJSClusterRequiredError())
+			} else {
+				require_Error(t, resp.Error, NewJSRequiredApiLevelError())
+			}
 		})
 	}
 }

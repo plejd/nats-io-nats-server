@@ -1,4 +1,4 @@
-// Copyright 2020-2025 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1135,7 +1137,8 @@ default_js_domain: {B:"DHUB"}
 	sLeaf1, _ := RunServerWithConfig(confLeaf1)
 	defer sLeaf1.Shutdown()
 
-	confLeaf2 := createConfFile(t, []byte(fmt.Sprintf(tmplL2, sd3, sHub1.getOpts().LeafNode.Port, sHub1.getOpts().LeafNode.Port)))
+	sd4 := t.TempDir()
+	confLeaf2 := createConfFile(t, []byte(fmt.Sprintf(tmplL2, sd4, sHub1.getOpts().LeafNode.Port, sHub1.getOpts().LeafNode.Port)))
 	sLeaf2, _ := RunServerWithConfig(confLeaf2)
 	defer sLeaf2.Shutdown()
 
@@ -1278,7 +1281,10 @@ func TestJetStreamLeafNodeJSClusterMigrateRecovery(t *testing.T) {
 	// supposed to have and then take them down.
 	remotes := map[*Server]int{}
 	for _, s := range lnc.servers {
-		remotes[s] += len(s.leafRemoteCfgs)
+		s.mu.RLock()
+		count := len(s.leafRemoteCfgs)
+		s.mu.RUnlock()
+		remotes[s] += count
 		s.closeAndDisableLeafnodes()
 		checkLeafNodeConnectedCount(t, s, 0)
 	}
@@ -1361,7 +1367,10 @@ func TestJetStreamLeafNodeJSClusterMigrateRecoveryWithDelay(t *testing.T) {
 	// supposed to have and then take them down.
 	remotes := map[*Server]int{}
 	for _, s := range lnc.servers {
-		remotes[s] += len(s.leafRemoteCfgs)
+		s.mu.RLock()
+		count := len(s.leafRemoteCfgs)
+		s.mu.RUnlock()
+		remotes[s] += count
 		s.closeAndDisableLeafnodes()
 		checkLeafNodeConnectedCount(t, s, 0)
 	}
@@ -1417,8 +1426,11 @@ func TestJetStreamLeafNodeJSClusterMigrateRecoveryWithDelay(t *testing.T) {
 
 	// Make sure all delay timers in remotes are disabled
 	for _, s := range lnc.servers {
-		for _, r := range s.leafRemoteCfgs {
-			require_True(t, r.jsMigrateTimer == nil)
+		for r := range s.leafRemoteCfgs {
+			r.RLock()
+			ok := r.jsMigrateTimer == nil
+			r.RUnlock()
+			require_True(t, ok)
 		}
 	}
 
@@ -1426,6 +1438,79 @@ func TestJetStreamLeafNodeJSClusterMigrateRecoveryWithDelay(t *testing.T) {
 	// have failed to elect a stream leader as they were stuck on a
 	// long election timer. Now this should work reliably.
 	lnc.waitOnStreamLeader(globalAccountName, "TEST")
+}
+
+func TestJetStreamLeafNodeJSClusterMigrateClearObserverOnRemoteRemoval(t *testing.T) {
+	tmpl := strings.Replace(jsClusterAccountsTempl, "store_dir:", "domain: hub, store_dir:", 1)
+	c := createJetStreamCluster(t, tmpl, "hub", _EMPTY_, 3, 12232, true)
+	defer c.shutdown()
+
+	tmpl = strings.Replace(jsClusterTemplWithLeafNode, "store_dir:", "domain: leaf, store_dir:", 1)
+	lnc := c.createLeafNodesWithTemplateAndStartPort(tmpl, "leaf", 3, 23913)
+	defer lnc.shutdown()
+
+	lnc.waitOnClusterReady()
+	for _, s := range lnc.servers {
+		s.setJetStreamMigrateOnRemoteLeaf()
+	}
+
+	nc, _ := jsClientConnect(t, lnc.randomServer())
+	defer nc.Close()
+
+	ljs, err := nc.JetStream(nats.Domain("leaf"))
+	require_NoError(t, err)
+
+	// Create an asset in the leafnode cluster.
+	si, err := ljs.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	require_Equal(t, si.Cluster.Name, "leaf")
+
+	// Take down the leafnode connections of one of the leaf servers so
+	// that checkJetStreamMigrate kicks in and moves its assets' raft
+	// nodes into observer mode.
+	s := lnc.randomServer()
+	s.closeAndDisableLeafnodes()
+	checkLeafNodeConnectedCount(t, s, 0)
+
+	checkFor(t, maxElectionTimeout, 200*time.Millisecond, func() error {
+		s.rnMu.RLock()
+		defer s.rnMu.RUnlock()
+		for name, n := range s.raftNodes {
+			// The metagroup is not expected to become an observer,
+			// but all other assets should.
+			if name != defaultMetaGroupName && !n.IsObserver() {
+				return fmt.Errorf("expected %q to be an observer", name)
+			}
+		}
+		return nil
+	})
+
+	// Now remove the leafnode remotes from the configuration of that
+	// server and reload. Since we will never reconnect, the observer
+	// state should be cleared so this server's assets can become
+	// leaders again.
+	content, err := os.ReadFile(s.configFile)
+	require_NoError(t, err)
+	re := regexp.MustCompile(`(?s)remotes \[.*?\n\t\t\]`)
+	newContent := re.ReplaceAllString(string(content), "remotes [ ]")
+	require_NotEqual(t, string(content), newContent)
+	changeCurrentConfigContentWithNewContent(t, s.configFile, []byte(newContent))
+	require_NoError(t, s.Reload())
+
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		s.rnMu.RLock()
+		defer s.rnMu.RUnlock()
+		for name, n := range s.raftNodes {
+			if n.IsObserver() {
+				return fmt.Errorf("expected %q to no longer be an observer", name)
+			}
+		}
+		return nil
+	})
 }
 
 // This will test that when a mirror or source construct is setup across a leafnode/domain
@@ -1877,4 +1962,209 @@ func TestJetStreamLeafNodeAndMirrorResyncAfterLeafEstablished(t *testing.T) {
 	})
 	defer sGW1.Shutdown()
 	defer sGW2.Shutdown()
+}
+
+func TestJetStreamSourceConsumerLeafReconnectStorm(t *testing.T) {
+	hubT := `
+		listen: -1
+		server_name: hub
+		jetstream { store_dir: '%s', domain: HUB }
+		leaf { port: -1 }
+	`
+	hubConf := createConfFile(t, []byte(fmt.Sprintf(hubT, t.TempDir())))
+	sHub, oHub := RunServerWithConfig(hubConf)
+	defer sHub.Shutdown()
+	hubLeafURL := fmt.Sprintf("nats://u:p@127.0.0.1:%d", oHub.LeafNode.Port)
+
+	leafT := `
+		listen: -1
+		server_name: %s
+		jetstream { store_dir: '%s', domain: %s }
+		leaf { remotes [ { url: %s } ], reconnect: "0.25s" }
+	`
+
+	type leafSpec struct {
+		name      string
+		domain    string
+		srcStream string
+		conf      string
+		srv       *Server
+	}
+	leafs := []*leafSpec{
+		{name: "leaf1", domain: "L1", srcStream: "S1"},
+		{name: "leaf2", domain: "L2", srcStream: "S2"},
+		{name: "leaf3", domain: "L3", srcStream: "S3"},
+	}
+	for _, lf := range leafs {
+		lf.conf = createConfFile(t, []byte(fmt.Sprintf(leafT, lf.name, t.TempDir(), lf.domain, hubLeafURL)))
+		lf.srv, _ = RunServerWithConfig(lf.conf)
+	}
+	defer func() {
+		for _, lf := range leafs {
+			if lf.srv != nil {
+				lf.srv.Shutdown()
+			}
+		}
+	}()
+
+	// All three leaves connected to the hub.
+	checkLeafNodeConnectedCount(t, sHub, 3)
+	for _, lf := range leafs {
+		checkLeafNodeConnectedCount(t, lf.srv, 1)
+	}
+
+	// Source streams on each leaf.
+	for _, lf := range leafs {
+		nc, js := jsClientConnect(t, lf.srv, nats.UserInfo("u", "p"))
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:     lf.srcStream,
+			Subjects: []string{lf.srcStream + ".>"},
+		})
+		require_NoError(t, err)
+		nc.Close()
+	}
+
+	// Aggregate stream on the hub sourcing from each leaf via that leaf's
+	// external API prefix.
+	ncHub, jsHub := jsClientConnect(t, sHub, nats.UserInfo("u", "p"))
+	defer ncHub.Close()
+
+	var sources []*nats.StreamSource
+	for _, lf := range leafs {
+		sources = append(sources, &nats.StreamSource{
+			Name:     lf.srcStream,
+			External: &nats.ExternalStream{APIPrefix: fmt.Sprintf("$JS.%s.API", lf.domain)},
+		})
+	}
+	_, err := jsHub.AddStream(&nats.StreamConfig{Name: "AGG", Sources: sources})
+	require_NoError(t, err)
+	mset, err := sHub.globalAccount().lookupStream("AGG")
+	require_NoError(t, err)
+
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		if got := len(mset.sources); got != len(leafs) {
+			return fmt.Errorf("expected %d sources, have %d", len(leafs), got)
+		}
+		for _, si := range mset.sources {
+			if si.cname == _EMPTY_ || si.sub == nil {
+				return fmt.Errorf("source %s not established", si.name)
+			}
+		}
+		return nil
+	})
+
+	// Force the unrelated sources into the setup-in-progress state that the
+	// buggy shouldRetry latches onto. Correct scoping must ignore them;
+	// buggy scoping force-cancels their healthy subs.
+	type snap struct {
+		cname string
+		sub   *subscription
+	}
+	pre := map[string]snap{}
+	mset.mu.Lock()
+	for _, si := range mset.sources {
+		pre[si.name] = snap{cname: si.cname, sub: si.sub}
+		if si.name == "S1" || si.name == "S3" {
+			si.sip = true
+		}
+	}
+	mset.mu.Unlock()
+
+	leafs[1].srv.Shutdown()
+	checkLeafNodeConnectedCount(t, sHub, 2)
+	leafs[1].srv, _ = RunServerWithConfig(leafs[1].conf)
+	checkLeafNodeConnectedCount(t, sHub, 3)
+	checkLeafNodeConnectedCount(t, leafs[1].srv, 1)
+
+	// processLeafNodeConnect → checkInternalSyncConsumers →
+	// retryDisconnectedSyncConsumers runs synchronously on the hub for the
+	// new connection; give it time to do (or fail to do) any damage.
+	time.Sleep(500 * time.Millisecond)
+
+	// Pointer-equality on *subscription is timing-robust:
+	// cancelSourceInfo() nils si.sub immediately, and any fresh setup
+	// produces a new *subscription, so disturbance shows up regardless of
+	// when we sample within the post-bounce window.
+	mset.mu.RLock()
+	post := map[string]snap{}
+	for _, si := range mset.sources {
+		post[si.name] = snap{cname: si.cname, sub: si.sub}
+	}
+	mset.mu.RUnlock()
+
+	for _, name := range []string{"S1", "S3"} {
+		if post[name].sub != pre[name].sub {
+			t.Errorf("source %q was recreated by leaf2 reconnect (different domain): "+
+				"pre.sub=%p post.sub=%p (cname pre=%q post=%q)",
+				name, pre[name].sub, post[name].sub,
+				pre[name].cname, post[name].cname)
+		}
+	}
+}
+
+func TestJetStreamSourceConsumerSetupTimerGoroutineLeak(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name: "AGG",
+		Sources: []*nats.StreamSource{{
+			Name:     "SRC",
+			External: &nats.ExternalStream{APIPrefix: "$JS.NONEXISTENT.API"},
+		}},
+	})
+	require_NoError(t, err)
+
+	mset, err := s.globalAccount().lookupStream("AGG")
+	require_NoError(t, err)
+
+	// Wait for the source's sourceInfo to be present.
+	var iname string
+	checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+		mset.mu.RLock()
+		defer mset.mu.RUnlock()
+		for in := range mset.sources {
+			iname = in
+			return nil
+		}
+		return errors.New("no source yet")
+	})
+
+	// Let the initial setup quiesce so its inner goroutine is the
+	// pre-existing baseline rather than being attributed to the leak.
+	time.Sleep(300 * time.Millisecond)
+	baseline := runtime.NumGoroutine()
+
+	// Per cycle: call retry, then wait one AfterFunc delay (100ms+rand(100ms))
+	// so the body fires and parks its inner goroutine in select.
+	const N = 30
+	for range N {
+		mset.mu.Lock()
+		if si := mset.sources[iname]; si != nil {
+			si.sip = true
+			// bypass the 2s retry throttle in setupSourceConsumer.
+			si.lreq = time.Time{}
+		}
+		mset.mu.Unlock()
+		mset.retryDisconnectedSyncConsumers()
+		time.Sleep(250 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	leaked := runtime.NumGoroutine() - baseline
+	const tolerance = 5
+	if leaked > tolerance {
+		t.Fatalf("AfterFunc-driven retry leaked %d goroutines after %d "+
+			"retryDisconnectedSyncConsumers cycles for a single iname "+
+			"(baseline=%d). Each cycle's AfterFunc fires a fresh "+
+			"trySetupSourceConsumer which spawns a new inner goroutine; "+
+			"the previous inner goroutine is orphaned in select, "+
+			"allowing linear ramp-up.",
+			leaked, N, baseline)
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2018-2025 The NATS Authors
+// Copyright 2018-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"runtime"
 	"runtime/debug"
@@ -247,14 +247,15 @@ type ServerCapability uint64
 
 // ServerInfo identifies remote servers.
 type ServerInfo struct {
-	Name     string            `json:"name"`
-	Host     string            `json:"host"`
-	ID       string            `json:"id"`
-	Cluster  string            `json:"cluster,omitempty"`
-	Domain   string            `json:"domain,omitempty"`
-	Version  string            `json:"ver"`
-	Tags     []string          `json:"tags,omitempty"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Name         string            `json:"name"`
+	Host         string            `json:"host"`
+	ID           string            `json:"id"`
+	Cluster      string            `json:"cluster,omitempty"`
+	Domain       string            `json:"domain,omitempty"`
+	Version      string            `json:"ver"`
+	Tags         []string          `json:"tags,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	FeatureFlags map[string]bool   `json:"feature_flags,omitempty"`
 	// Whether JetStream is enabled (deprecated in favor of the `ServerCapability`).
 	JetStream bool `json:"jetstream"`
 	// Generic capability flags
@@ -328,6 +329,7 @@ type ClientInfo struct {
 	ClientType string        `json:"client_type,omitempty"`
 	MQTTClient string        `json:"client_id,omitempty"` // This is the MQTT client ID
 	Nonce      string        `json:"nonce,omitempty"`
+	Reply      string        `json:"reply,omitempty"` // Original reply subject after a service import (only when needed).
 }
 
 // forAssignmentSnap returns the minimum amount of ClientInfo we need for assignment snapshots.
@@ -372,7 +374,9 @@ type ServerStats struct {
 	ActiveAccounts       int                   `json:"active_accounts"`
 	NumSubs              uint32                `json:"subscriptions"`
 	Sent                 DataStats             `json:"sent"`
+	SentToClients        DataStats             `json:"sent_to_clients"`
 	Received             DataStats             `json:"received"`
+	ReceivedFromClients  DataStats             `json:"received_from_clients"`
 	SlowConsumers        int64                 `json:"slow_consumers"`
 	SlowConsumersStats   *SlowConsumersStats   `json:"slow_consumer_stats,omitempty"`
 	StaleConnections     int64                 `json:"stale_connections,omitempty"`
@@ -404,17 +408,17 @@ type GatewayStat struct {
 	NumInbound int       `json:"inbound_connections"`
 }
 
-type dataStats struct {
+type MsgBytes struct {
 	Msgs  int64 `json:"msgs"`
 	Bytes int64 `json:"bytes"`
 }
 
 // DataStats reports how may msg and bytes. Applicable for both sent and received.
 type DataStats struct {
-	dataStats
-	Gateways dataStats `json:"gateways,omitempty"`
-	Routes   dataStats `json:"routes,omitempty"`
-	Leafs    dataStats `json:"leafs,omitempty"`
+	MsgBytes
+	Gateways *MsgBytes `json:"gateways,omitempty"`
+	Routes   *MsgBytes `json:"routes,omitempty"`
+	Leafs    *MsgBytes `json:"leafs,omitempty"`
 }
 
 // Used for internally queueing up messages that the server wants to send.
@@ -518,7 +522,7 @@ RESET:
 
 	// Grab tags and metadata.
 	opts := s.getOpts()
-	tags, metadata := opts.Tags, opts.Metadata
+	tags, metadata, featureFlags := opts.Tags, opts.Metadata, opts.getMergedFeatureFlags()
 
 	for s.eventsRunning() {
 		select {
@@ -536,6 +540,7 @@ RESET:
 					si.Time = time.Now().UTC()
 					si.Tags = tags
 					si.Metadata = metadata
+					si.FeatureFlags = featureFlags
 					si.Flags = 0
 					if js {
 						// New capability based flags.
@@ -609,7 +614,7 @@ RESET:
 
 				// Optional raw header addition.
 				if pm.hdr != nil {
-					b = append(pm.hdr, b...)
+					b = append(pm.hdr[:len(pm.hdr):len(pm.hdr)], b...)
 					nhdr := len(pm.hdr)
 					nsize := len(b) - LEN_CR_LF
 					// MQTT producers don't have CRLF, so add it back.
@@ -677,7 +682,7 @@ func (s *Server) sendLDMShutdownEventLocked() {
 	}
 	subj := fmt.Sprintf(lameDuckEventSubj, s.info.ID)
 	si := &ServerInfo{}
-	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, true))
+	s.sys.sendq.push(newPubMsg(nil, subj, _EMPTY_, si, nil, si, noCompression, false, false))
 }
 
 // Will send a shutdown message.
@@ -866,13 +871,13 @@ func routeStat(r *client) *RouteStat {
 	rs := &RouteStat{
 		ID: r.cid,
 		Sent: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  r.outMsgs,
 				Bytes: r.outBytes,
 			},
 		},
 		Received: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  atomic.LoadInt64(&r.inMsgs),
 				Bytes: atomic.LoadInt64(&r.inBytes),
 			},
@@ -945,8 +950,12 @@ func (s *Server) sendStatsz(subj string) {
 	m.Stats.ActiveAccounts = int(atomic.LoadInt32(&s.activeAccounts))
 	m.Stats.Received.Msgs = atomic.LoadInt64(&s.inMsgs)
 	m.Stats.Received.Bytes = atomic.LoadInt64(&s.inBytes)
+	m.Stats.ReceivedFromClients.Msgs = atomic.LoadInt64(&s.inClientMsgs)
+	m.Stats.ReceivedFromClients.Bytes = atomic.LoadInt64(&s.inClientBytes)
 	m.Stats.Sent.Msgs = atomic.LoadInt64(&s.outMsgs)
 	m.Stats.Sent.Bytes = atomic.LoadInt64(&s.outBytes)
+	m.Stats.SentToClients.Msgs = atomic.LoadInt64(&s.outClientMsgs)
+	m.Stats.SentToClients.Bytes = atomic.LoadInt64(&s.outClientBytes)
 	m.Stats.SlowConsumers = atomic.LoadInt64(&s.slowConsumers)
 	// Evaluate the slow consumer stats, but set it only if one of the value is not 0.
 	scs := &SlowConsumersStats{
@@ -985,7 +994,7 @@ func (s *Server) sendStatsz(subj string) {
 			// Note that *client.out[Msgs|Bytes] are not set using atomic,
 			// unlike the in[Msgs|bytes].
 			gs.Sent = DataStats{
-				dataStats: dataStats{
+				MsgBytes: MsgBytes{
 					Msgs:  c.outMsgs,
 					Bytes: c.outBytes,
 				},
@@ -1035,25 +1044,40 @@ func (s *Server) sendStatsz(subj string) {
 			if mg.Leader() {
 				if ci := s.raftNodeToClusterInfo(mg); ci != nil {
 					jStat.Meta = &MetaClusterInfo{
-						Name:     ci.Name,
-						Leader:   ci.Leader,
-						Peer:     getHash(ci.Leader),
-						Replicas: ci.Replicas,
-						Size:     mg.ClusterSize(),
+						Name:         ci.Name,
+						Leader:       ci.Leader,
+						Replicas:     ci.Replicas,
+						Size:         mg.ClusterSize(),
+						QuorumNeeded: mg.QuorumNeeded(),
+						Rescue:       mg.InRescue(),
+					}
+					if ci.Leader != _EMPTY_ {
+						jStat.Meta.Peer = getHash(ci.Leader)
 					}
 				}
 			} else {
 				// non leader only include a shortened version without peers
 				leader := s.serverNameForNode(mg.GroupLeader())
 				jStat.Meta = &MetaClusterInfo{
-					Name:   mg.Group(),
-					Leader: leader,
-					Peer:   getHash(leader),
-					Size:   mg.ClusterSize(),
+					Name:         mg.Group(),
+					Leader:       leader,
+					Size:         mg.ClusterSize(),
+					QuorumNeeded: mg.QuorumNeeded(),
+					Rescue:       mg.InRescue(),
+				}
+				if leader != _EMPTY_ {
+					jStat.Meta.Peer = getHash(leader)
 				}
 			}
-			if ipq := s.jsAPIRoutedReqs; ipq != nil && jStat.Meta != nil {
-				jStat.Meta.Pending = ipq.len()
+			if jStat.Meta != nil {
+				if ipq := s.jsAPIRoutedReqs; ipq != nil {
+					jStat.Meta.PendingRequests = ipq.len()
+				}
+				if ipq := s.jsAPIRoutedInfoReqs; ipq != nil {
+					jStat.Meta.PendingInfos = ipq.len()
+				}
+				jStat.Meta.Pending = jStat.Meta.PendingRequests + jStat.Meta.PendingInfos
+				jStat.Meta.Snapshot = s.metaClusterSnapshotStats(js, mg)
 			}
 		}
 		jStat.Limits = &s.getOpts().JetStreamLimits
@@ -1076,6 +1100,12 @@ func (s *Server) limitStatsz(subj string) bool {
 	// Only limit the normal broadcast subject.
 	if subj != fmt.Sprintf(serverStatsSubj, s.ID()) {
 		return false
+	}
+
+	// Peers mark us offline when we enter lame duck mode. A broadcast
+	// statsz would mark us online again and make us a placement target.
+	if s.ldm {
+		return true
 	}
 
 	interval := statszRateLimit
@@ -1500,6 +1530,8 @@ func (s *Server) initEventTracking() {
 type UserInfo struct {
 	UserID      string        `json:"user"`
 	Account     string        `json:"account"`
+	AccountName string        `json:"account_name,omitempty"`
+	UserName    string        `json:"user_name,omitempty"`
 	Permissions *Permissions  `json:"permissions,omitempty"`
 	Expires     time.Duration `json:"expires,omitempty"`
 }
@@ -1519,9 +1551,22 @@ func (s *Server) userInfoReq(sub *subscription, c *client, _ *Account, subject, 
 		return
 	}
 
+	// Look up the requester's account directly from ci.Account rather than
+	// using the acc returned by getRequestInfo, which may resolve to the
+	// service account (ci.Service) when the request arrives via a chained
+	// service import.
+	var accountName string
+	if ci.Account != _EMPTY_ {
+		if reqAcc, _ := s.LookupAccount(ci.Account); reqAcc != nil {
+			accountName = reqAcc.getNameTag()
+		}
+	}
+
 	response.Data = &UserInfo{
 		UserID:      ci.User,
 		Account:     ci.Account,
+		AccountName: accountName,
+		UserName:    ci.NameTag,
 		Permissions: c.publicPermissions(),
 		Expires:     c.claimExpiration(),
 	}
@@ -1734,25 +1779,33 @@ func (s *Server) remoteServerUpdate(sub *subscription, c *client, _ *Account, su
 
 	node := getHash(si.Name)
 	accountNRG := si.AccountNRG()
-	oldInfo, _ := s.nodeToInfo.Swap(node, nodeInfo{
-		si.Name,
-		si.Version,
-		si.Cluster,
-		si.Domain,
-		si.ID,
-		si.Tags,
-		cfg,
-		stats,
-		false,
-		si.JetStreamEnabled(),
-		si.BinaryStreamSnapshot(),
-		accountNRG,
-	})
+	newInfo := nodeInfo{
+		name:            si.Name,
+		version:         si.Version,
+		cluster:         si.Cluster,
+		domain:          si.Domain,
+		id:              si.ID,
+		tags:            si.Tags,
+		cfg:             cfg,
+		stats:           stats,
+		offline:         false,
+		js:              si.JetStreamEnabled(),
+		binarySnapshots: si.BinaryStreamSnapshot(),
+		accountNRG:      accountNRG,
+	}
+	oldInfo, _ := s.nodeToInfo.Swap(node, newInfo)
 	if oldInfo == nil || accountNRG != oldInfo.(nodeInfo).accountNRG {
 		// One of the servers we received statsz from changed its mind about
 		// whether or not it supports in-account NRG, so update the groups
 		// with this information.
 		s.updateNRGAccountStatus()
+	}
+
+	// Process a peer's statsz when it has sufficient information.
+	if newInfo.selectable() {
+		if js := s.getJetStream(); js != nil {
+			js.processPeerStatsz(node)
+		}
 	}
 }
 
@@ -1789,18 +1842,18 @@ func (s *Server) processNewServer(si *ServerInfo) {
 		// Only update if non-existent
 		if _, ok := s.nodeToInfo.Load(node); !ok {
 			s.nodeToInfo.Store(node, nodeInfo{
-				si.Name,
-				si.Version,
-				si.Cluster,
-				si.Domain,
-				si.ID,
-				si.Tags,
-				nil,
-				nil,
-				false,
-				si.JetStreamEnabled(),
-				si.BinaryStreamSnapshot(),
-				si.AccountNRG(),
+				name:            si.Name,
+				version:         si.Version,
+				cluster:         si.Cluster,
+				domain:          si.Domain,
+				id:              si.ID,
+				tags:            si.Tags,
+				cfg:             nil,
+				stats:           nil,
+				offline:         false,
+				js:              si.JetStreamEnabled(),
+				binarySnapshots: si.BinaryStreamSnapshot(),
+				accountNRG:      si.AccountNRG(),
 			})
 		}
 	}
@@ -1855,9 +1908,14 @@ func (s *Server) shutdownEventing() {
 	}
 
 	s.mu.Lock()
+	if s.sys == nil || s.sys.resetCh == nil {
+		s.mu.Unlock()
+		return
+	}
 	clearTimer(&s.sys.sweeper)
 	clearTimer(&s.sys.stmr)
-	rc := s.sys.resetCh
+	// We intentionally do not close resetCh. A sender that captured the channel
+	// may still attempt to send after the internal send loop has exited.
 	s.sys.resetCh = nil
 	wg := &s.sys.wg
 	s.mu.Unlock()
@@ -1877,9 +1935,6 @@ func (s *Server) shutdownEventing() {
 	})
 	// Turn everything off here.
 	s.sys = nil
-	// Make sure this is done after s.sys = nil, so that we don't
-	// get sends to closed channels on badly-timed config reloads.
-	close(rc)
 }
 
 // Request for our local connection count.
@@ -2195,7 +2250,7 @@ func (s *Server) statszReq(sub *subscription, c *client, _ *Account, subject, re
 	// No reply is a signal that we should use our normal broadcast subject.
 	if reply == _EMPTY_ {
 		reply = fmt.Sprintf(serverStatsSubj, s.info.ID)
-		s.wrapChk(s.resetLastStatsz)
+		s.wrapChk(s.resetLastStatsz)()
 	}
 
 	opts := StatszEventOptions{}
@@ -2449,37 +2504,37 @@ func (a *Account) statz() *AccountStat {
 
 	a.stats.Lock()
 	received := DataStats{
-		dataStats: dataStats{
+		MsgBytes: MsgBytes{
 			Msgs:  a.stats.inMsgs,
 			Bytes: a.stats.inBytes,
 		},
-		Gateways: dataStats{
+		Gateways: &MsgBytes{
 			Msgs:  a.stats.gw.inMsgs,
 			Bytes: a.stats.gw.inBytes,
 		},
-		Routes: dataStats{
+		Routes: &MsgBytes{
 			Msgs:  a.stats.rt.inMsgs,
 			Bytes: a.stats.rt.inBytes,
 		},
-		Leafs: dataStats{
+		Leafs: &MsgBytes{
 			Msgs:  a.stats.ln.inMsgs,
 			Bytes: a.stats.ln.inBytes,
 		},
 	}
 	sent := DataStats{
-		dataStats: dataStats{
+		MsgBytes: MsgBytes{
 			Msgs:  a.stats.outMsgs,
 			Bytes: a.stats.outBytes,
 		},
-		Gateways: dataStats{
+		Gateways: &MsgBytes{
 			Msgs:  a.stats.gw.outMsgs,
 			Bytes: a.stats.gw.outBytes,
 		},
-		Routes: dataStats{
+		Routes: &MsgBytes{
 			Msgs:  a.stats.rt.outMsgs,
 			Bytes: a.stats.rt.outBytes,
 		},
-		Leafs: dataStats{
+		Leafs: &MsgBytes{
 			Msgs:  a.stats.ln.outMsgs,
 			Bytes: a.stats.ln.outBytes,
 		},
@@ -2512,21 +2567,23 @@ func (s *Server) accConnsUpdate(a *Account) {
 	s.sendAccConnsUpdate(a, fmt.Sprintf(accConnsEventSubjOld, a.Name), fmt.Sprintf(accConnsEventSubjNew, a.Name))
 }
 
-// server lock should be held
 func (s *Server) nextEventID() string {
-	return s.eventIds.Next()
+	s.eventIdsMu.Lock()
+	id := s.eventIds.Next()
+	s.eventIdsMu.Unlock()
+	return id
 }
 
 // accountConnectEvent will send an account client connect event if there is interest.
 // This is a billing event.
 func (s *Server) accountConnectEvent(c *client) {
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	c.mu.Lock()
 	if c.acc == nil {
@@ -2567,13 +2624,13 @@ func (s *Server) accountConnectEvent(c *client) {
 // accountDisconnectEvent will send an account client disconnect event if there is interest.
 // This is a billing event.
 func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string) {
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	c.mu.Lock()
 
@@ -2607,13 +2664,13 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 			MQTTClient: c.getMQTTClientID(),
 		},
 		Sent: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  atomic.LoadInt64(&c.inMsgs),
 				Bytes: atomic.LoadInt64(&c.inBytes),
 			},
 		},
 		Received: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  c.outMsgs,
 				Bytes: c.outBytes,
 			},
@@ -2629,13 +2686,13 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 
 // This is the system level event sent to the system account for operators.
 func (s *Server) sendAuthErrorEvent(c *client, reason string) {
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	now := time.Now().UTC()
 	c.mu.Lock()
@@ -2665,13 +2722,13 @@ func (s *Server) sendAuthErrorEvent(c *client, reason string) {
 			MQTTClient: c.getMQTTClientID(),
 		},
 		Sent: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  c.inMsgs,
 				Bytes: c.inBytes,
 			},
 		},
 		Received: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  c.outMsgs,
 				Bytes: c.outBytes,
 			},
@@ -2691,13 +2748,13 @@ func (s *Server) sendAccountAuthErrorEvent(c *client, acc *Account, reason strin
 	if acc == nil {
 		return
 	}
-	s.mu.Lock()
-	if !s.eventsEnabled() {
-		s.mu.Unlock()
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	eid := s.nextEventID()
-	s.mu.Unlock()
 
 	now := time.Now().UTC()
 	c.mu.Lock()
@@ -2727,13 +2784,13 @@ func (s *Server) sendAccountAuthErrorEvent(c *client, acc *Account, reason strin
 			MQTTClient: c.getMQTTClientID(),
 		},
 		Sent: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  c.inMsgs,
 				Bytes: c.inBytes,
 			},
 		},
 		Received: DataStats{
-			dataStats: dataStats{
+			MsgBytes: MsgBytes{
 				Msgs:  c.outMsgs,
 				Bytes: c.outBytes,
 			},
@@ -2884,12 +2941,12 @@ func (s *Server) remoteLatencyUpdate(sub *subscription, _ *client, _ *Account, s
 	}
 	// Now get the request id / reply. We need to see if we have a GW prefix and if so strip that off.
 	reply := rl.ReqId
-	if gwPrefix, old := isGWRoutedSubjectAndIsOldPrefix([]byte(reply)); gwPrefix {
-		reply = string(getSubjectFromGWRoutedReply([]byte(reply), old))
+	if isGWRoutedReply([]byte(reply)) {
+		reply = string(getSubjectFromGWRoutedReply([]byte(reply)))
 	}
 	acc.mu.RLock()
 	si := acc.exports.responses[reply]
-	if si == nil {
+	if si == nil || si.latency == nil {
 		acc.mu.RUnlock()
 		return
 	}
@@ -2954,7 +3011,7 @@ func (s *Server) newRespInbox() string {
 	var b [respInboxPrefixLen + replySuffixLen]byte
 	pres := b[:respInboxPrefixLen]
 	copy(pres, s.sys.inboxPre)
-	rn := rand.Int63()
+	rn := rand.Int64()
 	for i, l := respInboxPrefixLen, rn; i < len(b); i++ {
 		b[i] = digits[l%base]
 		l /= base
@@ -3265,9 +3322,11 @@ func (s *Server) wrapChk(f func()) func() {
 // sendOCSPPeerRejectEvent sends a system level event to system account when a peer connection is
 // rejected due to OCSP invalid status of its trust chain(s).
 func (s *Server) sendOCSPPeerRejectEvent(kind string, peer *x509.Certificate, reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.eventsEnabled() {
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	serverID := s.info.ID
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	if peer == nil {
@@ -3291,16 +3350,18 @@ func (s *Server) sendOCSPPeerRejectEvent(kind string, peer *x509.Certificate, re
 		},
 		Reason: reason,
 	}
-	subj := fmt.Sprintf(ocspPeerRejectEventSubj, s.info.ID)
-	s.sendInternalMsg(subj, _EMPTY_, &m.Server, &m)
+	subj := fmt.Sprintf(ocspPeerRejectEventSubj, serverID)
+	s.sendInternalMsgLocked(subj, _EMPTY_, &m.Server, &m)
 }
 
 // sendOCSPPeerChainlinkInvalidEvent sends a system level event to system account when a link in a peer's trust chain
 // is OCSP invalid.
 func (s *Server) sendOCSPPeerChainlinkInvalidEvent(peer *x509.Certificate, link *x509.Certificate, reason string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.eventsEnabled() {
+	s.mu.RLock()
+	eventsEnabled := s.eventsEnabled()
+	serverID := s.info.ID
+	s.mu.RUnlock()
+	if !eventsEnabled {
 		return
 	}
 	if peer == nil || link == nil {
@@ -3329,6 +3390,6 @@ func (s *Server) sendOCSPPeerChainlinkInvalidEvent(peer *x509.Certificate, link 
 		},
 		Reason: reason,
 	}
-	subj := fmt.Sprintf(ocspPeerChainlinkInvalidEventSubj, s.info.ID)
-	s.sendInternalMsg(subj, _EMPTY_, &m.Server, &m)
+	subj := fmt.Sprintf(ocspPeerChainlinkInvalidEventSubj, serverID)
+	s.sendInternalMsgLocked(subj, _EMPTY_, &m.Server, &m)
 }

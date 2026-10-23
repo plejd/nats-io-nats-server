@@ -1,4 +1,4 @@
-// Copyright 2020-2025 The NATS Authors
+// Copyright 2020-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -71,10 +71,9 @@ const (
 // JSStreamActionAdvisory indicates that a stream was created, edited or deleted
 type JSStreamActionAdvisory struct {
 	TypedEvent
-	Stream   string             `json:"stream"`
-	Action   ActionAdvisoryType `json:"action"`
-	Template string             `json:"template,omitempty"` // Deprecated: stream templates are deprecated and will be removed in a future version.
-	Domain   string             `json:"domain,omitempty"`
+	Stream string             `json:"stream"`
+	Action ActionAdvisoryType `json:"action"`
+	Domain string             `json:"domain,omitempty"`
 }
 
 const JSStreamActionAdvisoryType = "io.nats.jetstream.advisory.v1.stream_action"
@@ -183,6 +182,7 @@ type JSSnapshotCompleteAdvisory struct {
 	End    time.Time   `json:"end"`
 	Client *ClientInfo `json:"client"`
 	Domain string      `json:"domain,omitempty"`
+	Error  string      `json:"error,omitempty"`
 }
 
 // JSSnapshotCompleteAdvisoryType is the schema type for JSSnapshotCreateAdvisory
@@ -252,6 +252,28 @@ type JSStreamQuorumLostAdvisory struct {
 	Replicas []*PeerInfo `json:"replicas"`
 	Domain   string      `json:"domain,omitempty"`
 }
+
+// JSStreamBatchAbandonedAdvisoryType is sent when a stream's atomic batch is abandoned.
+const JSStreamBatchAbandonedAdvisoryType = "io.nats.jetstream.advisory.v1.stream_batch_abandoned"
+
+// JSStreamBatchAbandonedAdvisory indicates that a stream's batch was abandoned.
+type JSStreamBatchAbandonedAdvisory struct {
+	TypedEvent
+	Account string             `json:"account,omitempty"`
+	Stream  string             `json:"stream"`
+	Domain  string             `json:"domain,omitempty"`
+	BatchId string             `json:"batch"`
+	Reason  BatchAbandonReason `json:"reason"`
+}
+
+type BatchAbandonReason string
+
+var (
+	BatchTimeout            BatchAbandonReason = "timeout"
+	BatchLarge              BatchAbandonReason = "large"
+	BatchIncomplete         BatchAbandonReason = "incomplete"
+	BatchRequirementsNotMet BatchAbandonReason = "unsupported"
+)
 
 // JSConsumerLeaderElectedAdvisoryType is sent when the system elects a leader for a consumer.
 const JSConsumerLeaderElectedAdvisoryType = "io.nats.jetstream.advisory.v1.consumer_leader_elected"
@@ -331,6 +353,22 @@ type JSServerRemovedAdvisory struct {
 	ServerID string `json:"server_id"`
 	Cluster  string `json:"cluster"`
 	Domain   string `json:"domain,omitempty"`
+}
+
+// JSMetaRescueAdvisoryType is sent when a server unsafely lowers the meta
+// group's quorum requirement for disaster recovery.
+const JSMetaRescueAdvisoryType = "io.nats.jetstream.advisory.v1.meta_rescue"
+
+// JSMetaRescueAdvisory indicates that a server has unsafely lowered the meta
+// group's quorum requirement for disaster recovery.
+type JSMetaRescueAdvisory struct {
+	TypedEvent
+	Server     string `json:"server"`
+	ServerID   string `json:"server_id"`
+	PrevQuorum int    `json:"prev_quorum"`
+	NewQuorum  int    `json:"new_quorum"`
+	Cluster    string `json:"cluster"`
+	Domain     string `json:"domain,omitempty"`
 }
 
 // JSAPILimitReachedAdvisoryType is sent when the JS API request queue limit is reached.

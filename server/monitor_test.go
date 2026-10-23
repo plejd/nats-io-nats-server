@@ -1,4 +1,4 @@
-// Copyright 2013-2025 The NATS Authors
+// Copyright 2013-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,13 +13,16 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -56,6 +59,7 @@ func DefaultMonitorOptions() *Options {
 		NoSigs:       true,
 		Tags:         []string{"tag"},
 		Metadata:     map[string]string{"key1": "value1", "key2": "value2"},
+		FeatureFlags: map[string]bool{"feature": false, "fix": true, "revert_fix": true},
 	}
 }
 
@@ -184,7 +188,6 @@ func TestMonitorNoPort(t *testing.T) {
 
 var (
 	appJSONContent = "application/json"
-	appJSContent   = "application/javascript"
 	textPlain      = "text/plain; charset=utf-8"
 	textHTML       = "text/html; charset=utf-8"
 )
@@ -272,6 +275,63 @@ func TestMonitorVarzSubscriptionsResetProperly(t *testing.T) {
 	}
 }
 
+// Must be run with -race.
+func TestMonitorVarzReloadRace(t *testing.T) {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.NoSystemAccount = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+
+	// Ensure s.varz is populated so the marshal path reads the shared object.
+	_, err := http.Get(url)
+	require_NoError(t, err)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader: hit /varz, which marshals s.varz under s.varzMu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				resp, err := http.Get(url)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}
+		}
+	}()
+
+	// Writer: reload, which mutates s.varz via updateVarzConfigReloadableFields.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if err := s.ReloadOptions(s.getOpts().Clone()); err != nil {
+					t.Errorf("Error on reload: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 func TestMonitorHandleVarz(t *testing.T) {
 	s, _ := runMonitorJSServer(t, -1, -1, 0, 0)
 	defer s.Shutdown()
@@ -304,14 +364,26 @@ func TestMonitorHandleVarz(t *testing.T) {
 		if v.InMsgs != 1 {
 			t.Fatalf("Expected InMsgs of 1, got %v\n", v.InMsgs)
 		}
-		if v.OutMsgs != 1 {
-			t.Fatalf("Expected OutMsgs of 1, got %v\n", v.OutMsgs)
-		}
 		if v.InBytes != 5 {
 			t.Fatalf("Expected InBytes of 5, got %v\n", v.InBytes)
 		}
+		if v.OutMsgs != 1 {
+			t.Fatalf("Expected OutMsgs of 1, got %v\n", v.OutMsgs)
+		}
 		if v.OutBytes != 5 {
 			t.Fatalf("Expected OutBytes of 5, got %v\n", v.OutBytes)
+		}
+		if v.InClientMsgs != 1 {
+			t.Fatalf("Expected InClientMsgs of 1, got %v\n", v.InClientMsgs)
+		}
+		if v.InClientBytes != 5 {
+			t.Fatalf("Expected InClientBytes of 5, got %v\n", v.InClientBytes)
+		}
+		if v.OutClientMsgs != 1 {
+			t.Fatalf("Expected OutClientMsgs of 1, got %v\n", v.OutClientMsgs)
+		}
+		if v.OutClientBytes != 5 {
+			t.Fatalf("Expected OutClientBytes of 5, got %v\n", v.OutClientBytes)
 		}
 		if v.Subscriptions <= 10 {
 			t.Fatalf("Expected Subscriptions of at least 10, got %v\n", v.Subscriptions)
@@ -339,12 +411,9 @@ func TestMonitorHandleVarz(t *testing.T) {
 			t.Fatalf("JS limits not set")
 		}
 		if v.JetStream.Limits.MaxHAAssets != 1000 {
-			t.Fatalf("Expected 1000 max_ha_assets got %q", v.JetStream.Limits.MaxHAAssets)
+			t.Fatalf("Expected 1000 max_ha_assets got %v", v.JetStream.Limits.MaxHAAssets)
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"varz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func pollConnz(t *testing.T, s *Server, mode int, url string, opts *ConnzOptions) *Connz {
@@ -422,9 +491,6 @@ func TestMonitorConnz(t *testing.T) {
 		testConnz(mode)
 		checkClientsCount(t, s, 0)
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"connz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestMonitorConnzBadParams(t *testing.T) {
@@ -557,6 +623,86 @@ func TestMonitorConnzWithCID(t *testing.T) {
 			t.Fatalf("Expected NumConns of 0, got %d\n", c.NumConns)
 		}
 	}
+}
+
+func TestMonitorConnzWithCIDAndAccountFilter(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: "127.0.0.1:-1"
+		http: "127.0.0.1:-1"
+		system_account: SYS
+		accounts {
+			A { users = [{ user: a, password: a }] }
+			B { users = [{ user: b, password: b }] }
+			SYS { users = [{ user: sys, password: sys }] }
+		}
+	`))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	ncA, err := nats.Connect(s.ClientURL(), nats.UserInfo("a", "a"))
+	require_NoError(t, err)
+	defer ncA.Close()
+	ncB, err := nats.Connect(s.ClientURL(), nats.UserInfo("b", "b"))
+	require_NoError(t, err)
+	defer ncB.Close()
+
+	cidA, err := ncA.GetClientID()
+	require_NoError(t, err)
+	cidB, err := ncB.GetClientID()
+	require_NoError(t, err)
+
+	checkConns := func(t *testing.T, c *Connz, expected int, cid uint64) {
+		t.Helper()
+		require_Len(t, len(c.Conns), expected)
+		require_Equal(t, c.NumConns, expected)
+		if expected > 0 {
+			require_Equal(t, c.Conns[0].Cid, cid)
+		}
+	}
+
+	for _, state := range []ConnState{ConnOpen, ConnAll} {
+		// Selecting a CID that belongs to the filtered account must work.
+		c, err := s.Connz(&ConnzOptions{Account: "A", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 1, cidA)
+
+		// Selecting a CID from another account must not leak that connection.
+		c, err = s.Connz(&ConnzOptions{Account: "A", CID: cidB, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 0, 0)
+
+		// The user filter must also apply when selecting by CID.
+		c, err = s.Connz(&ConnzOptions{User: "b", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 0, 0)
+		c, err = s.Connz(&ConnzOptions{User: "a", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 1, cidA)
+
+		// Same for the MQTT client ID filter.
+		c, err = s.Connz(&ConnzOptions{MQTTClient: "nope", CID: cidA, State: state})
+		require_NoError(t, err)
+		checkConns(t, c, 0, 0)
+	}
+
+	// An account user can request its own account's CONNZ through the system
+	// import. It must not be able to see other accounts' connections by CID.
+	sysReq := func(t *testing.T, nc *nats.Conn, cid uint64) *Connz {
+		t.Helper()
+		req, err := json.Marshal(&ConnzOptions{CID: cid})
+		require_NoError(t, err)
+		resp, err := nc.Request("$SYS.REQ.ACCOUNT.PING.CONNZ", req, time.Second)
+		require_NoError(t, err)
+		var r ServerAPIConnzResponse
+		require_NoError(t, json.Unmarshal(resp.Data, &r))
+		require_True(t, r.Error == nil)
+		require_True(t, r.Data != nil)
+		return r.Data
+	}
+	checkConns(t, sysReq(t, ncA, cidA), 1, cidA)
+	checkConns(t, sysReq(t, ncA, cidB), 0, 0)
+	checkConns(t, sysReq(t, ncB, cidB), 1, cidB)
+	checkConns(t, sysReq(t, ncB, cidA), 0, 0)
 }
 
 // Helper to map to connection name
@@ -801,6 +947,34 @@ func TestMonitorConnzWithOffsetAndLimit(t *testing.T) {
 			t.Fatalf("Expected Total to be 2, got %v", c.Total)
 		}
 	}
+}
+
+func TestMonitorConnzOffsetOverflow(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// Need at least one open connection so we get past the empty-result early
+	// return and reach the pagination slicing.
+	cl := createClientConnSubscribeAndPublish(t, s)
+	defer cl.Close()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		// Offset = math.MaxInt64, Limit = 1 makes Offset+Limit overflow to math.MinInt64.
+		c := pollConnz(t, s, mode, url+fmt.Sprintf("connz?offset=%d&limit=1", math.MaxInt64),
+			&ConnzOptions{Offset: math.MaxInt64, Limit: 1})
+		if c.Conns == nil || len(c.Conns) != 0 {
+			t.Fatalf("Expected 0 connections in array, got %v\n", len(c.Conns))
+		}
+		if c.NumConns != 0 {
+			t.Fatalf("Expected NumConns to be 0, got %v", c.NumConns)
+		}
+	}
+
+	// Both Offset and Limit at the max also overflows the sum.
+	_, err := s.Connz(&ConnzOptions{Offset: math.MaxInt64, Limit: math.MaxInt64})
+	require_NoError(t, err)
 }
 
 func TestMonitorConnzDefaultSorted(t *testing.T) {
@@ -1111,14 +1285,12 @@ func TestMonitorConnzSortedByStopTimeClosedConn(t *testing.T) {
 	checkClosedConns(t, s, 4, time.Second)
 
 	// Now adjust the Stop times for these with some random values.
-	s.mu.Lock()
 	now := time.Now().UTC()
 	ccs := s.closed.closedClients()
 	for _, cc := range ccs {
 		newStop := now.Add(time.Duration(rand.Int()%120) * -time.Minute)
 		cc.Stop = &newStop
 	}
-	s.mu.Unlock()
 
 	url = fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	for mode := 0; mode < 2; mode++ {
@@ -1156,13 +1328,11 @@ func TestMonitorConnzSortedByReason(t *testing.T) {
 	checkClosedConns(t, s, 20, time.Second)
 
 	// Now adjust the Reasons for these with some random values.
-	s.mu.Lock()
 	ccs := s.closed.closedClients()
 	max := int(ServerShutdown)
 	for _, cc := range ccs {
 		cc.Reason = ClosedState(rand.Int() % max).String()
 	}
-	s.mu.Unlock()
 
 	url = fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
 	for mode := 0; mode < 2; mode++ {
@@ -1335,7 +1505,7 @@ func TestMonitorConnzSortByIdleTime(t *testing.T) {
 
 	for name, conns := range cases {
 		t.Run(name, func(t *testing.T) {
-			sort.Sort(byIdle{conns, now})
+			sort.Sort(SortByIdle{conns, now})
 
 			idleDurations := getIdleDurations(conns, now)
 
@@ -1505,9 +1675,6 @@ func TestMonitorConnzWithRoutes(t *testing.T) {
 			}
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"routez?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestMonitorRoutezWithBadParams(t *testing.T) {
@@ -1562,9 +1729,6 @@ func TestSubsz(t *testing.T) {
 			}
 		}
 	}
-
-	// Test JSONP
-	readBodyEx(t, url+"subsz?callback=callback", http.StatusOK, appJSContent)
 }
 
 func TestSubszOperatorMode(t *testing.T) {
@@ -1670,6 +1834,37 @@ func TestMonitorSubszWithOffsetAndLimit(t *testing.T) {
 			t.Fatalf("Expected subscription details for 100 subs, got %d\n", len(sl.Subs))
 		}
 	}
+}
+
+func TestMonitorSubszOffsetOverflow(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	nc := createClientConnSubscribeAndPublish(t, s)
+	defer nc.Close()
+
+	_, err := nc.Subscribe("foo.*", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	_, err = nc.Subscribe("foo.bar", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	_, err = nc.Subscribe("foo.foo", func(m *nats.Msg) {})
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		// Offset = math.MaxInt64, Limit = 1 makes Offset+Limit overflow to math.MinInt64.
+		sl := pollSubsz(t, s, mode, url+fmt.Sprintf("subsz?subs=1&offset=%d&limit=1", math.MaxInt64),
+			&SubszOptions{Subscriptions: true, Offset: math.MaxInt64, Limit: 1})
+		if len(sl.Subs) != 0 {
+			t.Fatalf("Expected 0 subscription details, got %d", len(sl.Subs))
+		}
+	}
+
+	// Both Offset and Limit at the max also overflows the sum.
+	_, err = s.Subsz(&SubszOptions{Subscriptions: true, Offset: math.MaxInt64, Limit: math.MaxInt64})
+	require_NoError(t, err)
 }
 
 func TestMonitorSubszTestPubSubject(t *testing.T) {
@@ -2008,7 +2203,7 @@ func TestMonitorConnzClosedConnsBadClient(t *testing.T) {
 
 	opts := s.getOpts()
 
-	rc, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	rc, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
 	if err != nil {
 		t.Fatalf("Error on dial: %v", err)
 	}
@@ -2057,7 +2252,7 @@ func TestMonitorConnzClosedConnsBadTLSClient(t *testing.T) {
 
 	opts = s.getOpts()
 
-	rc, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	rc, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
 	if err != nil {
 		t.Fatalf("Error on dial: %v", err)
 	}
@@ -2267,7 +2462,7 @@ func TestMonitorConnzTLSInHandshake(t *testing.T) {
 	defer s.Shutdown()
 
 	// Create bare TCP connection to delay client TLS handshake
-	c, err := net.Dial("tcp", fmt.Sprintf("%s:%d", opts.Host, opts.Port))
+	c, err := net.Dial("tcp", net.JoinHostPort(opts.Host, fmt.Sprintf("%d", opts.Port)))
 	if err != nil {
 		t.Fatalf("Error on dial: %v", err)
 	}
@@ -2744,6 +2939,9 @@ func TestMonitorCluster(t *testing.T) {
 		opts.Cluster.TLSConfig != nil,
 		opts.Cluster.TLSConfig != nil,
 		DEFAULT_ROUTE_POOL_SIZE,
+		0,
+		_EMPTY_,
+		time.Time{},
 	}
 
 	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
@@ -2759,7 +2957,7 @@ func TestMonitorCluster(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = ClusterOptsVarz{"", "", 0, 0, nil, 2, false, false, 0}
+		_ = ClusterOptsVarz{"", "", 0, 0, nil, 2, false, false, 0, 0, _EMPTY_, time.Time{}}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -2914,6 +3112,9 @@ func TestMonitorGateway(t *testing.T) {
 		opts.Gateway.ConnectRetries,
 		[]RemoteGatewayOptsVarz{{"B", 1, nil}},
 		opts.Gateway.RejectUnknown,
+		0,
+		_EMPTY_,
+		time.Time{},
 	}
 	// Since URLs array is not guaranteed to be always the same order,
 	// we don't add it in the expected GatewayOptsVarz, instead we
@@ -2951,7 +3152,7 @@ func TestMonitorGateway(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in GatewayOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = GatewayOptsVarz{"", "", 0, 0, 0, false, false, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false}
+		_ = GatewayOptsVarz{"", "", 0, 0, 0, false, false, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false, 0, "default", time.Time{}}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -3137,6 +3338,9 @@ func TestMonitorLeafNode(t *testing.T) {
 			},
 		},
 		false,
+		0,
+		_EMPTY_,
+		time.Time{},
 	}
 
 	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
@@ -3161,7 +3365,7 @@ func TestMonitorLeafNode(t *testing.T) {
 
 		// Having this here to make sure that if fields are added in ClusterOptsVarz,
 		// we make sure to update this test (compiler will report an error if we don't)
-		_ = LeafNodeOptsVarz{"", 0, 0, 0, false, false, []RemoteLeafOptsVarz{{"", 0, nil, nil, false}}, false}
+		_ = LeafNodeOptsVarz{"", 0, 0, 0, false, false, []RemoteLeafOptsVarz{{"", 0, nil, nil, false}}, false, 0, _EMPTY_, time.Time{}}
 
 		// Alter the fields to make sure that we have a proper deep copy
 		// of what may be stored in the server. Anything we change here
@@ -4096,6 +4300,9 @@ func TestMonitorLeafz(t *testing.T) {
 	natsSub(t, nc2B, "foo", func(_ *nats.Msg) {})
 	natsFlush(t, nc2B)
 
+	checkSubInterest(t, sa, acc1.GetName(), "foo", time.Second)
+	checkSubInterest(t, sa, acc2.GetName(), "bar", time.Second)
+
 	nc1A := natsConnect(t, fmt.Sprintf("nats://user1:pwd@127.0.0.1:%d", oa.Port))
 	defer nc1A.Close()
 	natsPub(t, nc1A, "foo", []byte("hello"))
@@ -4342,6 +4549,84 @@ func TestMonitorAccountStatz(t *testing.T) {
 			}
 		}
 	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8251
+func TestMonitorAccountStatzLeafNodes(t *testing.T) {
+	hubConf := createConfFile(t, []byte(`
+		server_name: "hub"
+		listen: "127.0.0.1:-1"
+		http: "127.0.0.1:-1"
+		accounts {
+			LEAF_ACC { users [{user: leaf, password: pwd}] }
+			CLIENT_ACC { users [{user: client, password: pwd}] }
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	hub, hubOpts := RunServerWithConfig(hubConf)
+	defer hub.Shutdown()
+
+	leafConf := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: "leaf"
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			remotes = [
+				{url: "nats-leaf://leaf:pwd@127.0.0.1:%d"}
+			]
+		}
+	`, hubOpts.LeafNode.Port)))
+	leaf, _ := RunServerWithConfig(leafConf)
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+
+	// Connect a client to CLIENT_ACC, it will show up in the reporting.
+	nc := natsConnect(t, hub.ClientURL(), nats.UserInfo("client", "pwd"))
+	defer nc.Close()
+
+	checkAccounts := func(t *testing.T, stz *AccountStatz) {
+		t.Helper()
+		accounts := make(map[string]*AccountStat, len(stz.Accounts))
+		for _, acc := range stz.Accounts {
+			accounts[acc.Account] = acc
+		}
+
+		// The account with only a leaf node connection should be reported.
+		leafAcc, ok := accounts["LEAF_ACC"]
+		if !ok {
+			t.Fatalf("Expected account LEAF_ACC to be present, got %+v", stz.Accounts)
+		}
+		require_Equal(t, leafAcc.Conns, 0)
+		require_Equal(t, leafAcc.LeafNodes, 1)
+		require_Equal(t, leafAcc.TotalConns, 1)
+
+		// The account with a client connection should be reported.
+		clientAcc, ok := accounts["CLIENT_ACC"]
+		if !ok {
+			t.Fatalf("Expected account CLIENT_ACC to be present, got %+v", stz.Accounts)
+		}
+		require_Equal(t, clientAcc.Conns, 1)
+		require_Equal(t, clientAcc.LeafNodes, 0)
+		require_Equal(t, clientAcc.TotalConns, 1)
+
+		// Unused accounts should still be excluded.
+		if _, ok := accounts[DEFAULT_GLOBAL_ACCOUNT]; ok {
+			t.Fatalf("Did not expect unused account %q to be present, got %+v", DEFAULT_GLOBAL_ACCOUNT, stz.Accounts)
+		}
+	}
+
+	// Check without unused=true and without account filtering.
+	for pollMode := 0; pollMode < 2; pollMode++ {
+		stz := pollAccountStatz(t, hub, pollMode, fmt.Sprintf("http://127.0.0.1:%d%s", hub.MonitorAddr().Port, AccountStatzPath), &AccountStatzOptions{})
+		checkAccounts(t, stz)
+	}
+
+	// Check with explicit account filtering. Only available through AccountStatz() directly.
+	stz, err := hub.AccountStatz(&AccountStatzOptions{Accounts: []string{"LEAF_ACC", "CLIENT_ACC", DEFAULT_GLOBAL_ACCOUNT}})
+	require_NoError(t, err)
+	checkAccounts(t, stz)
 }
 
 func runMonitorServerWithOperator(t *testing.T, sysName, accName string) ([]*Server, nkeys.KeyPair, nkeys.KeyPair) {
@@ -4923,6 +5208,105 @@ func TestMonitorAuthorizedUsers(t *testing.T) {
 	checkAuthUser(upub)
 }
 
+func testMonitorConnzJWTVisibility(t *testing.T, bearer bool) {
+	t.Helper()
+
+	opts := DefaultMonitorOptions()
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts.TrustedKeys = []string{pub}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	akp, _ := nkeys.CreateAccount()
+	apub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(apub)
+	ajwt, err := nac.Encode(oKp)
+	require_NoError(t, err)
+
+	nkp, _ := nkeys.CreateUser()
+	upub, _ := nkp.PublicKey()
+	nuc := jwt.NewUserClaims(upub)
+	nuc.BearerToken = bearer
+	userJWT, err := nuc.Encode(akp)
+	require_NoError(t, err)
+
+	buildMemAccResolver(s)
+	addAccountToMemResolver(s, apub, ajwt)
+
+	conn, err := net.Dial("tcp", s.Addr().String())
+	require_NoError(t, err)
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
+	require_NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	cr := bufio.NewReaderSize(conn, maxBufSize)
+	info, err := cr.ReadString('\n')
+	require_NoError(t, err)
+
+	var sigField string
+	if !bearer {
+		var ni nonceInfo
+		require_NoError(t, json.Unmarshal([]byte(info[5:]), &ni))
+		sigraw, err := nkp.Sign([]byte(ni.Nonce))
+		require_NoError(t, err)
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+		sigField = fmt.Sprintf(",\"sig\":\"%s\"", sig)
+	}
+	cs := fmt.Sprintf("CONNECT {\"jwt\":%q,\"verbose\":true,\"pedantic\":true%s}\r\n", userJWT, sigField)
+	_, err = conn.Write([]byte(cs))
+	require_NoError(t, err)
+	l, err := cr.ReadString('\n')
+	require_NoError(t, err)
+	if !strings.HasPrefix(l, "+OK") {
+		t.Fatalf("Expected +OK, got %q", l)
+	}
+
+	expectedJWT := userJWT
+	if bearer {
+		expectedJWT = _EMPTY_
+	}
+
+	checkConnzJWT := func(url, expectedJWT string) {
+		t.Helper()
+		var connz *Connz
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			connz = pollConnz(t, s, 0, url, nil)
+			if len(connz.Conns) != 1 {
+				return fmt.Errorf("expected 1 connection, got %d", len(connz.Conns))
+			}
+			return nil
+		})
+		ci := connz.Conns[0]
+		require_Equal(t, ci.JWT, expectedJWT)
+	}
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d/connz", s.MonitorAddr().Port)
+	checkConnzJWT(baseURL+"?auth=1", expectedJWT)
+
+	require_NoError(t, conn.Close())
+	conn = nil
+
+	checkConnzJWT(baseURL+"?state=closed", expectedJWT)
+	checkConnzJWT(baseURL+"?auth=1&state=closed", expectedJWT)
+}
+
+func TestMonitorConnzJWTVisibility(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		bearer bool
+	}{
+		{name: "bearer", bearer: true},
+		{name: "non-bearer", bearer: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testMonitorConnzJWTVisibility(t, test.bearer)
+		})
+	}
+}
+
 // Helper function to check that a JS cluster is formed
 func checkForJSClusterUp(t *testing.T, servers ...*Server) {
 	t.Helper()
@@ -5238,6 +5622,40 @@ func TestMonitorJsz(t *testing.T) {
 			}
 		}
 	})
+	t.Run("direct-consumers", func(t *testing.T) {
+		// It could take time for the sourcing to set up.
+		checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+			for _, url := range []string{monUrl1, monUrl2} {
+				info := readJsInfo(url + "?acc=ACC&consumers=true&direct-consumers=true")
+				if len(info.AccountDetails) != 1 {
+					t.Fatalf("expected account ACC to be returned by %s but got %v", url, info)
+				}
+				for _, stream := range info.AccountDetails[0].Streams {
+					if len(stream.DirectConsumer) == 0 {
+						continue
+					}
+					if stream.Name != "my-stream-replicated" {
+						t.Fatalf("expected direct consumers only on the mirror origin stream, %s reported %d on %q",
+							url, len(stream.DirectConsumer), stream.Name)
+					}
+					if len(stream.DirectConsumer) != 1 {
+						t.Fatalf("expected exactly one direct consumer on %q but %s returned %d",
+							stream.Name, url, len(stream.DirectConsumer))
+					}
+					for _, dc := range stream.DirectConsumer {
+						if slices.ContainsFunc(stream.Consumer, func(c *ConsumerInfo) bool {
+							return c.Name == dc.Name
+						}) {
+							t.Fatalf("public consumer %q leaked into the direct consumer list of %q on %s",
+								dc.Name, stream.Name, url)
+						}
+					}
+					return nil
+				}
+			}
+			return fmt.Errorf("expected direct consumer info to be present on one of the servers")
+		})
+	})
 	t.Run("config", func(t *testing.T) {
 		for _, url := range []string{monUrl1, monUrl2} {
 			info := readJsInfo(url + "?acc=ACC&consumers=true&config=true")
@@ -5278,29 +5696,66 @@ func TestMonitorJsz(t *testing.T) {
 		}
 	})
 	t.Run("cluster-info", func(t *testing.T) {
-		found := 0
-		for i, url := range []string{monUrl1, monUrl2} {
+		for _, url := range []string{monUrl1, monUrl2} {
 			info := readJsInfo(url + "")
 			if info.Meta.Peer != getHash(info.Meta.Leader) {
 				t.Fatalf("Invalid Peer: %+v", info.Meta)
 			}
-			if info.Meta.Replicas != nil {
-				found++
-				for _, r := range info.Meta.Replicas {
-					if r.Peer == _EMPTY_ {
-						t.Fatalf("Replicas' Peer is empty: %+v", r)
-					}
-				}
-				if info.Meta.Leader != srvs[i].Name() {
-					t.Fatalf("received cluster info from non leader: leader %s, server: %s", info.Meta.Leader, srvs[i].Name())
+			// Replicas are populated on every server, not just the meta leader.
+			if len(info.Meta.Replicas) == 0 {
+				t.Fatalf("Expected replicas to be populated: %+v", info.Meta)
+			}
+			for _, r := range info.Meta.Replicas {
+				if r.Peer == _EMPTY_ {
+					t.Fatalf("Replicas' Peer is empty: %+v", r)
 				}
 			}
 		}
-		if found == 0 {
-			t.Fatalf("did not receive cluster info from any node")
-		}
-		if found > 1 {
-			t.Fatalf("received cluster info from multiple nodes")
+	})
+	t.Run("meta-snapshot-stats", func(t *testing.T) {
+		for _, url := range []string{monUrl1, monUrl2} {
+			info := readJsInfo(url)
+			require_True(t, info.Meta != nil)
+			require_True(t, info.Meta.Snapshot != nil)
+
+			snapshot := info.Meta.Snapshot
+
+			// In case no snapshots have happened there would be some pending entries.
+			if snapshot.LastTime.IsZero() {
+				require_True(t, snapshot.PendingEntries >= 1)
+				require_True(t, snapshot.PendingSize >= 1)
+			}
+
+			// Force meta snapshots on both servers to test snapshot timing.
+			for _, srv := range srvs {
+				if js := srv.getJetStream(); js != nil {
+					if mg := js.getMetaGroup(); mg != nil {
+						if snap, _, _, err := js.metaSnapshot(); err == nil {
+							mg.InstallSnapshot(snap, false)
+						}
+					}
+				}
+			}
+			// Wait for snapshot timing to be recorded
+			time.Sleep(100 * time.Millisecond)
+
+			// Get latest stats again.
+			info = readJsInfo(url)
+			require_True(t, info.Meta != nil)
+			require_True(t, info.Meta.Snapshot != nil)
+
+			snapshot = info.Meta.Snapshot
+
+			require_True(t, !snapshot.LastTime.IsZero())
+			// Assert that snapshot time is in UTC
+			require_Equal(t, snapshot.LastTime.Location(), time.UTC)
+
+			// Assert that duration is non-negative and reasonable
+			require_True(t, snapshot.LastDuration >= 0)
+			require_True(t, snapshot.LastDuration < 30*time.Second)
+
+			// Assert that snapshot time is recent.
+			require_True(t, time.Since(snapshot.LastTime) < 5*time.Minute)
 		}
 	})
 	t.Run("account-non-existing", func(t *testing.T) {
@@ -5543,7 +5998,7 @@ func TestMonitorWebsocket(t *testing.T) {
 		TLSMap:           true,
 		TLSPinnedCerts:   pinnedCerts,
 		SameOrigin:       true,
-		AllowedOrigins:   []string{"origin1", "origin2"},
+		AllowedOrigins:   []string{"https://origin1", "https://origin2"},
 		Compression:      true,
 		HandshakeTimeout: 4 * time.Second,
 	}
@@ -5561,7 +6016,7 @@ func TestMonitorWebsocket(t *testing.T) {
 		TLSMap:           true,
 		TLSPinnedCerts:   []string{"7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069"},
 		SameOrigin:       true,
-		AllowedOrigins:   []string{"origin1", "origin2"},
+		AllowedOrigins:   []string{"https://origin1", "https://origin2"},
 		Compression:      true,
 		HandshakeTimeout: 4 * time.Second,
 	}
@@ -6077,50 +6532,13 @@ func TestMonitorAccountszMappingOrderReporting(t *testing.T) {
 	}
 }
 
-// createCallbackURL adds a callback query parameter for JSONP requests.
-func createCallbackURL(t *testing.T, endpoint string) string {
-	t.Helper()
-
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	params := u.Query()
-	params.Set("callback", "callback")
-
-	u.RawQuery = params.Encode()
-
-	return u.String()
-}
-
-// stripCallback removes the JSONP callback function from the response.
-// Returns the JSON body without the wrapping callback function.
-// If there's no callback function, the data is returned as is.
-func stripCallback(data []byte) []byte {
-	// Cut the JSONP callback function with the opening parentheses.
-	_, after, found := bytes.Cut(data, []byte("("))
-
-	if found {
-		return bytes.TrimSuffix(after, []byte(")"))
-	}
-
-	return data
-}
-
-// expectHealthStatus makes 1 regular and 1 JSONP request to the URL and checks the
-// HTTP status code, Content-Type header and health status string.
+// expectHealthStatus makes a request to the URL and checks the HTTP status code,
+// Content-Type header and health status string.
 func expectHealthStatus(t *testing.T, url string, statusCode int, wantStatus string) {
 	t.Helper()
 
-	// First check for regular requests.
 	body := readBodyEx(t, url, statusCode, appJSONContent)
 	checkHealthStatus(t, body, wantStatus)
-
-	// Another check for JSONP requests.
-	jsonpURL := createCallbackURL(t, url) // Adds a callback query param.
-	jsonpBody := readBodyEx(t, jsonpURL, statusCode, appJSContent)
-	checkHealthStatus(t, stripCallback(jsonpBody), wantStatus)
 }
 
 // checkHealthStatus checks the health status from a JSON response.
@@ -6238,44 +6656,152 @@ func TestMonitorHealthzStatusUnavailable(t *testing.T) {
 	}
 }
 
-// When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
-// any or any to a generic parameterized type. So this stopped working and panics.
-// Copyright 2013-2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-// Make sure that we do not run the http server for monitoring unless asked.
-// https://github.com/nats-io/nats-server/issues/2170
-// Just the ever increasing subs part.
-// Helper to map to connection name
-// getConnsIdleDurations returns a slice of parsed idle durations from a connection info slice.
-// sortedDurationsDesc checks if a time.Duration slice is sorted in descending order.
-// getIdleDurations returns a slice of idle durations from a connection info list up until now time.
-// sortedDurationsAsc checks if a time.Duration slice is sorted in ascending order.
-// Tests handle root
-// Make sure options for ConnInfo like subs=1, authuser, etc do not cause a race.
-// Make sure a bad client that is disconnected right away has proper values.
-// Make sure a bad client that tries to connect plain to TLS has proper values.
-// Create a connection to test ConnInfo
-// Benchmark our Connz generation. Don't use HTTP here, just measure server endpoint.
-// Helper function to check that a JS cluster is formed
-// https://github.com/nats-io/nats-server/issues/4144
-// createCallbackURL adds a callback query parameter for JSONP requests.
-// stripCallback removes the JSONP callback function from the response.
-// Returns the JSON body without the wrapping callback function.
-// If there's no callback function, the data is returned as is.
-// expectHealthStatus makes 1 regular and 1 JSONP request to the URL and checks the
-// HTTP status code, Content-Type header and health status string.
-// checkHealthStatus checks the health status from a JSON response.
-// checkHealthzEndpoint makes requests to the /healthz endpoint and checks the health status.
+func TestServerHealthz(t *testing.T) {
+	t.Run("BasicHealth", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Test with nil options
+		status := s.Healthz(nil)
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+		if status.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status code %d, got %d", http.StatusOK, status.StatusCode)
+		}
+
+		// Test with empty options
+		status = s.Healthz(&HealthzOptions{})
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+
+		// Test with JSServerOnly option
+		status = s.Healthz(&HealthzOptions{JSServerOnly: true})
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+	})
+
+	t.Run("BadRequestMissingAccount", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Stream without account should return bad request
+		status := s.Healthz(&HealthzOptions{Stream: "TEST"})
+		if status.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status code %d, got %d", http.StatusBadRequest, status.StatusCode)
+		}
+		if status.Status != "error" {
+			t.Fatalf("Expected status 'error', got %q", status.Status)
+		}
+	})
+
+	t.Run("BadRequestMissingStream", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Consumer without stream should return bad request
+		status := s.Healthz(&HealthzOptions{Account: "ACC", Consumer: "TEST"})
+		if status.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status code %d, got %d", http.StatusBadRequest, status.StatusCode)
+		}
+		if status.Status != "error" {
+			t.Fatalf("Expected status 'error', got %q", status.Status)
+		}
+	})
+
+	t.Run("DetailsOption", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Test with Details option - should still return ok for healthy server
+		status := s.Healthz(&HealthzOptions{Details: true})
+		if status == nil {
+			t.Fatal("Expected non-nil HealthStatus")
+		}
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok', got %q", status.Status)
+		}
+
+		// Test bad request with details - should populate Errors slice
+		status = s.Healthz(&HealthzOptions{Stream: "TEST", Details: true})
+		if status.StatusCode != http.StatusBadRequest {
+			t.Fatalf("Expected status code %d, got %d", http.StatusBadRequest, status.StatusCode)
+		}
+		if len(status.Errors) == 0 {
+			t.Fatal("Expected Errors slice to be populated with Details=true")
+		}
+		if status.Errors[0].Type != HealthzErrorBadRequest {
+			t.Fatalf("Expected error type %v, got %v", HealthzErrorBadRequest, status.Errors[0].Type)
+		}
+	})
+
+	t.Run("ServerNotReady", func(t *testing.T) {
+		s := runMonitorServer()
+		defer s.Shutdown()
+
+		// Simulate server not ready by removing listener
+		s.mu.Lock()
+		sl := s.listener
+		s.listener = nil
+		s.mu.Unlock()
+
+		status := s.Healthz(nil)
+		if status.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("Expected status code %d, got %d", http.StatusInternalServerError, status.StatusCode)
+		}
+		if status.Status != "error" {
+			t.Fatalf("Expected status 'error', got %q", status.Status)
+		}
+
+		// Restore for proper shutdown
+		s.mu.Lock()
+		s.listener = sl
+		s.mu.Unlock()
+	})
+
+	t.Run("JetStreamUnavailable", func(t *testing.T) {
+		opts := DefaultMonitorOptions()
+		opts.JetStream = true
+		s := RunServer(opts)
+		defer s.Shutdown()
+
+		if !s.JetStreamEnabled() {
+			t.Fatalf("want JetStream to be enabled first")
+		}
+
+		err := s.DisableJetStream()
+		if err != nil {
+			t.Fatalf("got an error disabling JetStream: %v", err)
+		}
+
+		// Should report unavailable when JS is disabled
+		status := s.Healthz(nil)
+		if status.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("Expected status code %d, got %d", http.StatusServiceUnavailable, status.StatusCode)
+		}
+		if status.Status != "unavailable" {
+			t.Fatalf("Expected status 'unavailable', got %q", status.Status)
+		}
+
+		// JSServerOnly should still report ok
+		status = s.Healthz(&HealthzOptions{JSServerOnly: true})
+		if status.Status != "ok" {
+			t.Fatalf("Expected status 'ok' with JSServerOnly, got %q", status.Status)
+		}
+	})
+}
+
 // When we converted ipq to use generics we still were using sync.Map. Currently you can not convert
 // any or any to a generic parameterized type. So this stopped working and panics.
 func TestMonitorIpqzWithGenerics(t *testing.T) {
@@ -6338,5 +6864,253 @@ func TestMonitorVarzMetadata(t *testing.T) {
 	expected := map[string]string{"key1": "value1", "key2": "value2"}
 	if !reflect.DeepEqual(expected, v.Metadata) {
 		t.Fatalf("expected: %v, got: %v", expected, v.Metadata)
+	}
+}
+
+func TestMonitorVarzFeatureFlags(t *testing.T) {
+	featureFlags["fix"] = false
+	t.Cleanup(func() { delete(featureFlags, "fix") })
+
+	expected := make(map[string]bool)
+	for k, v := range featureFlags {
+		expected[k] = v
+	}
+	expected["fix"] = true
+
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	v, err := s.Varz(nil)
+	require_NoError(t, err)
+
+	if !reflect.DeepEqual(expected, v.FeatureFlags) {
+		t.Fatalf("expected: %v, got: %v", expected, v.FeatureFlags)
+	}
+}
+
+func TestMonitorVarzTLSCertEndDate(t *testing.T) {
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	tlsConfig, err := GenTLSConfig(
+		&TLSConfigOpts{
+			CertFile: "../test/configs/certs/server-cert.pem",
+			KeyFile:  "../test/configs/certs/server-key.pem",
+			CaFile:   "../test/configs/certs/ca.pem",
+		})
+	if err != nil {
+		t.Fatalf("Error generating TLS config: %v", err)
+	}
+
+	opts.TLSConfig = tlsConfig
+	opts.Cluster.TLSConfig = tlsConfig
+	opts.Gateway.TLSConfig = tlsConfig
+	opts.LeafNode.TLSConfig = tlsConfig
+	opts.MQTT.TLSConfig = tlsConfig
+	opts.Websocket.TLSConfig = tlsConfig
+
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	v := pollVarz(t, s, 0, url, nil)
+
+	expected := time.Date(2032, 8, 24, 20, 23, 02, 0, time.UTC)
+
+	check := func(t *testing.T, notAfter time.Time) {
+		t.Helper()
+		if notAfter != expected {
+			t.Fatalf("Expected expiration date '%v', got '%v'", expected, notAfter)
+		}
+	}
+
+	check(t, v.TLSCertNotAfter)
+	check(t, v.Cluster.TLSCertNotAfter)
+	check(t, v.Gateway.TLSCertNotAfter)
+	check(t, v.LeafNode.TLSCertNotAfter)
+	check(t, v.MQTT.TLSCertNotAfter)
+	check(t, v.Websocket.TLSCertNotAfter)
+}
+
+func TestMetaClusterInfoSnapshotStats(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Create a stream to generate some meta activity.
+	s := c.randomNonLeader()
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	leader := c.leader()
+	require_True(t, leader != nil)
+
+	// Check Jsz() includes Snapshot.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		jsi, err := leader.Jsz(nil)
+		if err != nil {
+			return err
+		}
+		if jsi.Meta == nil {
+			return errors.New("expected meta cluster info from Jsz")
+		}
+		if jsi.Meta.Snapshot == nil {
+			return errors.New("expected snapshot stats in Jsz meta cluster info")
+		}
+		return nil
+	})
+
+	// Check Varz() includes Snapshot.
+	checkFor(t, 5*time.Second, 250*time.Millisecond, func() error {
+		v, err := leader.Varz(nil)
+		if err != nil {
+			return err
+		}
+		if v.JetStream.Meta == nil {
+			return errors.New("expected meta cluster info from Varz")
+		}
+		if v.JetStream.Meta.Snapshot == nil {
+			return errors.New("expected snapshot stats in Varz meta cluster info")
+		}
+		return nil
+	})
+
+	// Check STATSZ event includes Snapshot.
+	snc, _ := jsClientConnect(t, c.randomServer(), nats.UserInfo("admin", "s3cr3t!"))
+	defer snc.Close()
+
+	ch := make(chan *nats.Msg, 1)
+	_, err = snc.ChanSubscribe(fmt.Sprintf(serverStatsSubj, leader.ID()), ch)
+	require_NoError(t, err)
+
+	msg := require_ChanRead(t, ch, 5*time.Second)
+	var m ServerStatsMsg
+	require_NoError(t, json.Unmarshal(msg.Data, &m))
+	require_True(t, m.Stats.JetStream != nil)
+	require_True(t, m.Stats.JetStream.Meta != nil)
+	require_True(t, m.Stats.JetStream.Meta.Snapshot != nil)
+}
+
+func TestMonitorConnzAccountRace(t *testing.T) {
+	s := runMonitorServerWithAccounts()
+	defer s.Shutdown()
+
+	accA, err := s.LookupAccount("A")
+	if err != nil {
+		t.Fatalf("LookupAccount A: %v", err)
+	}
+	accB, err := s.LookupAccount("B")
+	if err != nil {
+		t.Fatalf("LookupAccount B: %v", err)
+	}
+
+	// Real client bound to account A.
+	nc := createClientConnWithUserSubscribeAndPublish(t, s, "a", "a")
+	defer nc.Close()
+
+	// Grab the server-side *client.
+	var c *client
+	checkFor(t, 2*time.Second, 5*time.Millisecond, func() error {
+		accA.mu.RLock()
+		defer accA.mu.RUnlock()
+		for cl := range accA.clients {
+			c = cl
+			return nil
+		}
+		return errors.New("could not find server-side client for account A")
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: write c.acc under c.mu, mimicking registerWithAccount /
+	// swapAccountAfterReload binding/swapping an account.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c.mu.Lock()
+			if c.acc == accA {
+				c.acc = accB
+			} else {
+				c.acc = accA
+			}
+			c.mu.Unlock()
+		}
+	}()
+
+	// Reader: account-filter path reads client.acc / client.acc.Name under only s.mu.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := s.Connz(&ConnzOptions{Account: "A"}); err != nil {
+				t.Errorf("Connz error: %v", err)
+				return
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Restore so shutdown/cleanup is consistent.
+	c.mu.Lock()
+	c.acc = accA
+	c.mu.Unlock()
+}
+
+func TestConnzClosedSubsDetailNoSharedMutation(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	// Inject a closed client with subscription detail directly into the ring buffer.
+	cc := &closedClient{}
+	cc.Cid = 1
+	cc.subs = []SubDetail{{Subject: "foo.bar"}}
+	cc.NumSubs = 1
+	s.closed.append(cc)
+
+	// Concurrently request closed connections with subscription detail.
+	var wg sync.WaitGroup
+	opts := &ConnzOptions{State: ConnClosed, SubscriptionsDetail: true}
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.Connz(opts); err != nil {
+				t.Errorf("Error on Connz: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The shared cached object must not have been mutated.
+	s.mu.Lock()
+	leaked := cc.SubsDetail != nil
+	s.mu.Unlock()
+	require_False(t, leaked)
+
+	// A plain closed-conn query must not carry SubsDetail.
+	c, err := s.Connz(&ConnzOptions{State: ConnClosed})
+	require_NoError(t, err)
+	require_Len(t, len(c.Conns), 1)
+	if c.Conns[0].SubsDetail != nil {
+		t.Fatalf("Plain closed-conn query unexpectedly carried SubsDetail: %+v", c.Conns[0].SubsDetail)
 	}
 }

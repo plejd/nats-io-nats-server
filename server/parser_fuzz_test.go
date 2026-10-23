@@ -1,4 +1,4 @@
-// Copyright 2025 The NATS Authors
+// Copyright 2025-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -33,7 +33,10 @@ func dummyFuzzClient(kind int) *client {
 	}
 
 	return &client{
-		srv:   New(&defaultServerOptions),
+		srv: func() *Server {
+			opts := defaultServerOptions
+			return New(&opts)
+		}(),
 		kind:  kind,
 		msubs: -1,
 		in: readCache{

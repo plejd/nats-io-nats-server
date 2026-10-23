@@ -1,4 +1,4 @@
-// Copyright 2022-2025 The NATS Authors
+// Copyright 2022-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -32,9 +32,17 @@ const (
 	AuthRequestXKeyHeader = "Nats-Server-Xkey"
 )
 
+func titleCase(m string) string {
+	r := []rune(m)
+	if len(r) == 0 {
+		return _EMPTY_
+	}
+	return string(append([]rune{unicode.ToUpper(r[0])}, r[1:]...))
+}
+
 // Process a callout on this client's behalf.
-func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequired, trustedProxy bool) (authorized bool, errStr string) {
-	isOperatorMode := len(opts.TrustedKeys) > 0
+func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequired, trustedProxy bool, ujwt string) (authorized bool, errStr string) {
+	isOperatorMode := s.trustedKeys != nil
 
 	// this is the account the user connected in, or the one running the callout
 	var acc *Account
@@ -49,6 +57,13 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 		}
 	} else {
 		acc = c.acc
+	}
+	if acc == nil {
+		// FIX for https://github.com/nats-io/nats-server/issues/7841
+		// hand rolled creds on leafnode became crasher here
+		errStr = fmt.Sprintf("%s not mapped to a callout account", c.kindString())
+		s.Warnf(errStr)
+		return false, errStr
 	}
 
 	// Check if we have been requested to encrypt.
@@ -66,9 +81,6 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 		xkp, xkey = s.xkp, s.info.XKey
 	}
 
-	// FIXME: so things like the server ID that get assigned, are used as a sort of nonce - but
-	//  reality is that the keypair here, is generated, so the response generated a JWT has to be
-	//  this user - no replay possible
 	// Create a keypair for the user. We will expect this public user to be in the signed response.
 	// This prevents replay attacks.
 	ukp, _ := nkeys.CreateUser()
@@ -120,22 +132,28 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return nil, errors.New("auth callout violation: auth callout response is not for server")
 		}
 
+		// if response is encrypted none of this is needed
+		if !encrypted {
+			if isOperatorMode {
+				// The asserted issuer account, if any, must be the callout account.
+				if cr.IssuerAccount != _EMPTY_ && cr.IssuerAccount != account {
+					return nil, fmt.Errorf("auth callout response issuer account %q is not the callout account", cr.IssuerAccount)
+				}
+				// The actual signer must be the callout account or one of its signing keys.
+				if cr.Issuer != account {
+					if _, ok := acc.hasIssuer(cr.Issuer); !ok {
+						return nil, errors.New("auth callout signing key is unknown")
+					}
+				}
+			} else if opts.AuthCallout == nil || cr.Issuer != opts.AuthCallout.Issuer {
+				// The signer must be the configured issuer.
+				return nil, errors.New("auth callout signing key is unknown")
+			}
+		}
+
 		// check if had an error message from the auth account
 		if cr.Error != _EMPTY_ {
 			return nil, fmt.Errorf("auth callout service returned an error: %v", cr.Error)
-		}
-
-		// if response is encrypted none of this is needed
-		if isOperatorMode && !encrypted {
-			pkStr := cr.Issuer
-			if cr.IssuerAccount != _EMPTY_ {
-				pkStr = cr.IssuerAccount
-			}
-			if pkStr != account {
-				if _, ok := acc.signingKeys[pkStr]; !ok {
-					return nil, errors.New("auth callout signing key is unknown")
-				}
-			}
 		}
 
 		return jwt.DecodeUserClaims(cr.Jwt)
@@ -234,11 +252,6 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	}
 
 	processReply := func(_ *subscription, rc *client, racc *Account, subject, reply string, rmsg []byte) {
-		titleCase := func(m string) string {
-			r := []rune(m)
-			return string(append([]rune{unicode.ToUpper(r[0])}, r[1:]...))
-		}
-
 		arc, err := decodeResponse(rc, rmsg, racc)
 		if err != nil {
 			c.authViolation()
@@ -284,6 +297,15 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		// The scoped template may have introduced a proxy requirement.
+		if arc.ProxyRequired && !trustedProxy {
+			err = ErrAuthProxyRequired
+			c.setAuthError(err)
+			c.authViolation()
+			respCh <- titleCase(err.Error())
+			return
+		}
+
 		// the JWT is cleared, because if in operator mode it may hold the JWT
 		// for the bearer token that connected to the callout if in operator mode
 		// the permissions are already set on the client, this prevents a decode
@@ -300,16 +322,17 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 			return
 		}
 
+		c.mu.Lock()
+		c.flags.set(authCallout)
 		// See if the response wants to override the username.
 		if arc.Name != _EMPTY_ {
-			c.mu.Lock()
 			c.opts.Username = arc.Name
 			// Clear any others.
 			c.opts.Nkey = _EMPTY_
 			c.pubKey = _EMPTY_
 			c.opts.Token = _EMPTY_
-			c.mu.Unlock()
 		}
+		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.
 		c.setExpiration(arc.Claims(), expiration)
@@ -367,7 +390,7 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	// Grab client info for the request.
 	c.mu.Lock()
 	c.fillClientInfo(&claim.ClientInformation)
-	c.fillConnectOpts(&claim.ConnectOptions)
+	c.fillConnectOpts(&claim.ConnectOptions, ujwt)
 	// If we have a sig in the client opts, fill in nonce.
 	if claim.ConnectOptions.SignedNonce != _EMPTY_ {
 		claim.ClientInformation.Nonce = string(c.nonce)
@@ -467,16 +490,22 @@ func (c *client) fillClientInfo(ci *jwt.ClientInformation) {
 
 // Fill in client options.
 // Lock should be held.
-func (c *client) fillConnectOpts(opts *jwt.ConnectOptions) {
+func (c *client) fillConnectOpts(opts *jwt.ConnectOptions, ujwt string) {
 	if c == nil || (c.kind != CLIENT && c.kind != LEAF && c.kind != JETSTREAM && c.kind != ACCOUNT) {
 		return
 	}
 
 	o := c.opts
+	if ujwt == _EMPTY_ {
+		// The caller may supply a reconstructed JWT that should be sent to auth
+		// callout without storing it in c.opts.JWT. If not, fall back to the client
+		// option as before.
+		ujwt = o.JWT
+	}
 
 	// Do it this way to fail to compile if fields are added to jwt.ClientInformation.
 	*opts = jwt.ConnectOptions{
-		JWT:         o.JWT,
+		JWT:         ujwt,
 		Nkey:        o.Nkey,
 		SignedNonce: o.Sig,
 		Token:       o.Token,

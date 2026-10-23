@@ -16,83 +16,38 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 jobs:
-  signoffs:
-    name: Sign-offs
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
-    if: github.ref != 'refs/heads/main'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Check all branch commits are signed off
-        if: github.event_name != 'pull_request'
-        run: |
-          for c in $(git rev-list --no-merges ${{ github.event.before }}..${{ github.event.after }}); do
-            msg="$(git log -1 --pretty=%B "$c")"
-            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by: Your Name <your.email@example.com>\` line"
-              git log -1 --pretty=format:"%h %s" "$c"
-              missing=1
-            fi
-          done
-          exit $missing
-
-      - name: Check all PR commits are signed off
-        if: github.event_name == 'pull_request'
-        run: |
-          for c in $(git rev-list origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }}); do
-            msg="$(git log -1 --pretty=%B "$c")"
-            if ! printf '%s\n' "$msg" | grep -q '^Signed-off-by:'; then
-              echo "::error ::Commit $c has not been signed off in the commit message with a \`Signed-off-by: Your Name <your.email@example.com>\` line"
-              git log -1 --pretty=format:"%h %s" "$c"
-              missing=1
-            fi
-          done
-          exit $missing
-
-      - name: Check PR description is signed off
-        if: github.event_name == 'pull_request'
-        env:
-          PR_DESC: ${{ github.event.pull_request.body }}
-        run: |
-          grep -Pq '^Signed-off-by:\s*(?!Your Name|.*<your\.email@example\.com>)' <<<"$PR_DESC" || {
-          echo "::error ::Pull request has not been signed off in the PR description with a \`Signed-off-by:\` line"
-          exit 1
-          }
-
   lint:
     name: Lint
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
 
       - name: Run golangci-lint
         # Use commit hash here to avoid a re-tagging attack, as this is a third-party action
-        # Commit 1481404843c368bc19ca9406f87d6e0fc97bdcfd = tag v7.0.0
-        uses: golangci/golangci-lint-action@1481404843c368bc19ca9406f87d6e0fc97bdcfd
+        # Commit ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a = tag v9.3.0
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
         with:
-          version: v2.3.1
+          version: v2.13.0
           skip-cache: true
           skip-save-cache: true
           args: --timeout=5m --config=.golangci.yml
 
   build-latest:
     name: Build (Latest Go)
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    needs: [lint]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -104,13 +59,14 @@ jobs:
 
   build-supported:
     name: Build (Minimum Go)
-    runs-on: ${{ vars.GHA_WORKER_SMALL || 'ubuntu-latest' }}
+    needs: [lint]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
 
@@ -125,6 +81,7 @@ jobs:
   # only, as the Windows builds take a fair bit longer to set up.
   build-windows:
     name: Build (Minimum Go, ${{ matrix.os }})
+    needs: [lint]
     strategy:
       fail-fast: false
       matrix:
@@ -132,10 +89,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: "go.mod"
 
@@ -149,10 +106,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -166,10 +123,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -183,10 +140,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -200,10 +157,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -217,10 +174,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -234,10 +191,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -251,10 +208,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -268,10 +225,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -285,10 +242,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -302,10 +259,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -319,10 +276,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -336,10 +293,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -353,10 +310,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -370,10 +327,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -387,10 +344,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
@@ -404,10 +361,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 

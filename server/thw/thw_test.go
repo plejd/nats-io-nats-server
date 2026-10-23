@@ -1,4 +1,4 @@
-// Copyright 2024-2025 The NATS Authors
+// Copyright 2024-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,6 +14,8 @@
 package thw
 
 import (
+	"encoding/binary"
+	"io"
 	"math"
 	"testing"
 	"time"
@@ -248,6 +250,36 @@ func TestHashWheelEncodeDecode(t *testing.T) {
 			require_True(t, ok)
 			require_Equal(t, ts, nts)
 		}
+	}
+}
+
+func TestHashWheelDecodeRejectsMalformed(t *testing.T) {
+	// Build a valid header that claims the given number of entries.
+	header := func(count uint64) []byte {
+		b := make([]byte, headerLen)
+		b[0] = 1                                    // Magic version
+		binary.LittleEndian.PutUint64(b[1:], count) // Entry count
+		binary.LittleEndian.PutUint64(b[9:], 0)     // High sequence stamp
+		return b
+	}
+
+	for _, test := range []struct {
+		title string
+		buf   []byte
+		err   error
+	}{
+		{title: "ShortHeader", buf: make([]byte, headerLen-1), err: io.ErrShortBuffer},
+		{title: "BadVersion", buf: func() []byte { b := header(0); b[0] = 2; return b }(), err: ErrInvalidVersion},
+		// Claims one entry but the buffer ends right after the header.
+		{title: "TruncatedAtVarints", buf: header(1), err: io.ErrUnexpectedEOF},
+		// Has the timestamp varint but the seq varint is missing.
+		{title: "TruncatedSeq", buf: append(header(1), binary.AppendVarint(nil, 12345)...), err: io.ErrUnexpectedEOF},
+	} {
+		t.Run(test.title, func(t *testing.T) {
+			hw := NewHashWheel()
+			_, err := hw.Decode(test.buf)
+			require_Error(t, err, test.err)
+		})
 	}
 }
 

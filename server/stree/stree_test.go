@@ -1,4 +1,4 @@
-// Copyright 2023-2025 The NATS Authors
+// Copyright 2023-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,10 +18,14 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats-server/v2/server/gsl"
 )
 
 // Print Results: go test -v  --args --results
@@ -393,6 +397,40 @@ func TestSubjectTreeMatchNodes(t *testing.T) {
 	match(t, st, "foo.baz.>", 3)
 }
 
+func matchUntilCount[T any](st *SubjectTree[T], filter string, stopAfter int) (int, bool) {
+	var n int
+	completed := st.MatchUntil(b(filter), func(_ []byte, _ *T) bool {
+		n++
+		return n < stopAfter
+	})
+	return n, completed
+}
+
+func TestSubjectTreeMatchUntil(t *testing.T) {
+	st := NewSubjectTree[int]()
+	st.Insert(b("foo.bar.A"), 1)
+	st.Insert(b("foo.bar.B"), 2)
+	st.Insert(b("foo.bar.C"), 3)
+	st.Insert(b("foo.baz.A"), 11)
+	st.Insert(b("foo.baz.B"), 22)
+	st.Insert(b("foo.baz.C"), 33)
+	st.Insert(b("foo.bar"), 42)
+
+	// Ensure early stop terminates traversal.
+	count, completed := matchUntilCount(st, "foo.>", 3)
+	require_Equal(t, count, 3)
+	require_False(t, completed)
+
+	// Match completes
+	count, completed = matchUntilCount(st, "foo.bar", 3)
+	require_Equal(t, count, 1)
+	require_True(t, completed)
+
+	count, completed = matchUntilCount(st, "foo.baz.*", 4)
+	require_Equal(t, count, 3)
+	require_True(t, completed)
+}
+
 func TestSubjectTreeNoPrefix(t *testing.T) {
 	st := NewSubjectTree[int]()
 	for i := 0; i < 26; i++ {
@@ -454,7 +492,7 @@ func TestSubjectTreeMatchSubjectParam(t *testing.T) {
 func TestSubjectTreeMatchRandomDoublePWC(t *testing.T) {
 	st := NewSubjectTree[int]()
 	for i := 1; i <= 10_000; i++ {
-		subj := fmt.Sprintf("foo.%d.%d", rand.Intn(20)+1, i)
+		subj := fmt.Sprintf("foo.%d.%d", rand.IntN(20)+1, i)
 		st.Insert(b(subj), 42)
 	}
 	match(t, st, "foo.*.*", 10_000)
@@ -628,8 +666,10 @@ func TestSubjectTreeMatchInvalidWildcard(t *testing.T) {
 	st.Insert(b("foo.123"), 22)
 	st.Insert(b("one.two.three.four.five"), 22)
 	st.Insert(b("'*.123"), 22)
+	st.Insert(b("bar"), 22)
 	match(t, st, "invalid.>", 0)
-	match(t, st, ">", 3)
+	match(t, st, "foo.>.bar", 0)
+	match(t, st, ">", 4)
 	match(t, st, `'*.*`, 1)
 	match(t, st, `'*.*.*'`, 0)
 	// None of these should match.
@@ -660,9 +700,9 @@ func TestSubjectTreeRandomTrackEntries(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		var sb strings.Builder
 		// 1-6 tokens.
-		numTokens := rand.Intn(6) + 1
+		numTokens := rand.IntN(6) + 1
 		for i := 0; i < numTokens; i++ {
-			tlen := rand.Intn(4) + 2
+			tlen := rand.IntN(4) + 2
 			tok := buf[:tlen]
 			crand.Read(tok)
 			sb.WriteString(hex.EncodeToString(tok))
@@ -715,7 +755,7 @@ func TestSubjectTreeMatchAllPerf(t *testing.T) {
 	st := NewSubjectTree[int]()
 
 	for i := 0; i < 1_000_000; i++ {
-		subj := fmt.Sprintf("subj.%d.%d", rand.Intn(100)+1, i)
+		subj := fmt.Sprintf("subj.%d.%d", rand.IntN(100)+1, i)
 		st.Insert(b(subj), 22)
 	}
 
@@ -745,7 +785,7 @@ func TestSubjectTreeIterPerf(t *testing.T) {
 	st := NewSubjectTree[int]()
 
 	for i := 0; i < 1_000_000; i++ {
-		subj := fmt.Sprintf("subj.%d.%d", rand.Intn(100)+1, i)
+		subj := fmt.Sprintf("subj.%d.%d", rand.IntN(100)+1, i)
 		st.Insert(b(subj), 22)
 	}
 
@@ -756,6 +796,86 @@ func TestSubjectTreeIterPerf(t *testing.T) {
 		return true
 	})
 	t.Logf("Iter took %s and matched %d entries", time.Since(start), count)
+}
+
+func TestSubjectTreeMemoryPerf(t *testing.T) {
+	if !*runResults {
+		t.Skip()
+	}
+
+	const entries = 250_000
+	subjects := make([][]byte, entries)
+	for i := range subjects {
+		subjects[i] = []byte("account." + strconv.Itoa(i%1000) + ".stream." + strconv.Itoa(i))
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	start := time.Now()
+	st := NewSubjectTree[int]()
+	for i, subject := range subjects {
+		st.Insert(subject, i)
+	}
+	buildTime := time.Since(start)
+
+	runtime.GC()
+	runtime.KeepAlive(st)
+	runtime.ReadMemStats(&after)
+
+	const lookupRounds = 8
+	start = time.Now()
+	found := 0
+	for range lookupRounds {
+		for _, subject := range subjects {
+			if _, ok := st.Find(subject); ok {
+				found++
+			}
+		}
+	}
+	findTime := time.Since(start)
+
+	const traversalRounds = 20
+	start = time.Now()
+	iterated := 0
+	for range traversalRounds {
+		st.IterFast(func(_ []byte, _ *int) bool {
+			iterated++
+			return true
+		})
+	}
+	iterTime := time.Since(start)
+
+	filter := []byte("account.*.stream.>")
+	start = time.Now()
+	matched := 0
+	for range traversalRounds {
+		st.Match(filter, func(_ []byte, _ *int) {
+			matched++
+		})
+	}
+	matchTime := time.Since(start)
+
+	iterAllocs := testing.AllocsPerRun(20, func() {
+		st.IterFast(func(_ []byte, _ *int) bool { return true })
+	})
+	matchAllocs := testing.AllocsPerRun(20, func() {
+		st.Match(filter, func(_ []byte, _ *int) {})
+	})
+
+	t.Logf("Build took %s for %d entries, allocated %d bytes total and retained %d heap bytes across %d allocations",
+		buildTime, st.Size(), after.TotalAlloc-before.TotalAlloc,
+		after.HeapAlloc-before.HeapAlloc, after.Mallocs-before.Mallocs)
+	t.Logf("Find took %s for %d lookups and found %d entries",
+		findTime, entries*lookupRounds, found)
+	t.Logf("IterFast took %s for %d entries with %.0f allocations per traversal",
+		iterTime, iterated, iterAllocs)
+	t.Logf("Match took %s for %d entries with %.0f allocations per traversal",
+		matchTime, matched, matchAllocs)
+
+	runtime.KeepAlive(subjects)
+	runtime.KeepAlive(st)
 }
 
 func TestSubjectTreeNode48(t *testing.T) {
@@ -955,6 +1075,350 @@ func TestSubjectTreeLazyIntersect(t *testing.T) {
 	require_Equal(t, len(intersected), 2)
 	require_Equal(t, intersected["foo.bar"], 1)
 	require_Equal(t, intersected["foo.bar.baz.qux"], 1)
+}
+
+func TestSubjectTreeGSLIntersection(t *testing.T) {
+	st := NewSubjectTree[struct{}]()
+	st.Insert([]byte("one.two.three.four"), struct{}{})
+	st.Insert([]byte("one.two.three.five"), struct{}{})
+	st.Insert([]byte("one.two.six"), struct{}{})
+	st.Insert([]byte("one.two.seven"), struct{}{})
+	st.Insert([]byte("eight.nine"), struct{}{})
+	st.Insert([]byte("stream.A"), struct{}{})
+	st.Insert([]byte("stream.A.child"), struct{}{})
+
+	require_NoDuplicates := func(t *testing.T, got map[string]int) {
+		t.Helper()
+		for _, c := range got {
+			require_Equal(t, c, 1)
+		}
+	}
+
+	t.Run("Literals", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.two.six", 11))
+		require_NoError(t, sl.Insert("eight.nine", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWC", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.two.*.*", 11))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCOverlapping", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.two.*.four", 11))
+		require_NoError(t, sl.Insert("one.two.*.*", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCAll", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("*.*", 11))
+		require_NoError(t, sl.Insert("*.*.*", 22))
+		require_NoError(t, sl.Insert("*.*.*.*", 33))
+		require_True(t, sl.HasInterest("foo.bar"))
+		require_True(t, sl.HasInterest("foo.bar.baz"))
+		require_True(t, sl.HasInterest("foo.bar.baz.qux"))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 7)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("FWC", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.>", 11))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 4)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("FWCOverlapping", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.two.three.four", 11))
+		require_NoError(t, sl.Insert("one.>", 22))
+		require_NoError(t, sl.Insert(">", 33))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 7)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("FWCExtended", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.>", 11))
+		require_NoError(t, sl.Insert("stream.A", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtended", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.*.child", 11))
+		require_NoError(t, sl.Insert("stream.A", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.child", 11))
+		require_NoError(t, sl.Insert("*.A.child", 22))
+		require_NoError(t, sl.Insert("stream.*.child", 22))
+		require_NoError(t, sl.Insert("stream.A.*", 22))
+		require_NoError(t, sl.Insert("stream.*.*", 22))
+		require_NoError(t, sl.Insert("*.A.*", 22))
+		require_NoError(t, sl.Insert("*.*.child", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 1)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive2", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.child", 11))
+		require_NoError(t, sl.Insert("*.A.child", 22))
+		require_NoError(t, sl.Insert("stream.A.*", 22))
+		require_NoError(t, sl.Insert("*.A.*", 22))
+		require_NoError(t, sl.Insert("*.*.child", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 1)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive3", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.child", 11))
+		require_NoError(t, sl.Insert("stream.*.*", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 1)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive4", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.child", 11))
+		require_NoError(t, sl.Insert("stream.*.>", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 1)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive5", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.child", 11))
+		require_NoError(t, sl.Insert("*.*", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 3)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive6", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.child", 11))
+		require_NoError(t, sl.Insert("stream.*", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCExtendedAggressive7", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A", 11))
+		require_NoError(t, sl.Insert("*.*.*", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 4)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("FWCAll", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert(">", 11))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 7)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("StopsWhenCallbackReturnsFalse", func(t *testing.T) {
+		var got int
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert(">", 11))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got++
+			return false
+		})
+		require_Equal(t, got, 1)
+	})
+
+	t.Run("NoMatch", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one", 11))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 0)
+	})
+
+	t.Run("NoMatches", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one", 11))
+		require_NoError(t, sl.Insert("eight", 22))
+		require_NoError(t, sl.Insert("ten", 33))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 0)
+	})
+
+	t.Run("NoMatchPartial", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("stream.A.not-child", 11))
+		require_NoError(t, sl.Insert("stream.A.child.>", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 0)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCDoesntHideLiteral", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.*.six", 11))
+		require_NoError(t, sl.Insert("one.two.seven", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("PWCDoesntHideLiteral2", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.*.*.four", 11))
+		require_NoError(t, sl.Insert("one.*.*.five", 22))
+		require_NoError(t, sl.Insert("one.*.three", 33))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("DisjointWildcardPositions", func(t *testing.T) {
+		// Test case documenting bitmask approach limitation:
+		// When patterns have wildcards at different positions (not strict subsets),
+		// the bitmask considers earlier-position wildcards as "less specific"
+		// which can cause some matches to be skipped.
+		// e.g., *.two.three.four (wildcard at pos 0) vs one.two.*.* (wildcards at pos 2,3)
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.two.*.*", 33))
+		require_NoError(t, sl.Insert("*.two.three.four", 55))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		// Due to bitmask comparison, one.two.*.* may be skipped in favor of *.two.three.four
+		// This results in only one.two.three.four being matched, missing one.two.three.five
+		require_Len(t, len(got), 2)
+		require_NoDuplicates(t, got)
+	})
+
+	t.Run("LiteralMatchWithOverlappingPWCs", func(t *testing.T) {
+		got := map[string]int{}
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert("one.*.four.five", 11))
+		require_NoError(t, sl.Insert("one.two.three.four", 22))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got[string(subj)]++
+			return true
+		})
+		require_Len(t, len(got), 1)
+		require_NoDuplicates(t, got)
+	})
 }
 
 func TestSubjectTreeDeleteShortSubjectNoPanic(t *testing.T) {
@@ -1571,7 +2035,7 @@ func TestMatchPartsEdgeCases(t *testing.T) {
 
 	// Test with a fragment that will cause partial matching
 	frag := b("foo.test")
-	remaining, matched := matchParts(parts, frag)
+	remaining, matched := matchParts(parts, string(frag))
 	require_True(t, matched)
 	require_True(t, len(remaining) > 0)
 }
@@ -1711,7 +2175,7 @@ func TestMatchPartsMoreEdgeCases(t *testing.T) {
 	// Test the remaining 2.6% of matchParts
 	// Case where frag is empty
 	parts := genParts(b("foo.*"), nil)
-	remaining, matched := matchParts(parts, b(""))
+	remaining, matched := matchParts(parts, "")
 	require_True(t, matched)
 	require_Equal(t, len(remaining), len(parts))
 }

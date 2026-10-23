@@ -1,4 +1,4 @@
-// Copyright 2016-2025 The NATS Authors
+// Copyright 2016-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,12 +16,11 @@ package server
 import (
 	"bytes"
 	"errors"
+	"iter"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
-
-	"github.com/nats-io/nats-server/v2/server/stree"
 )
 
 // Sublist is a routing mechanism to handle subject distribution and
@@ -61,6 +60,10 @@ type SublistResult struct {
 	psubs []*subscription
 	qsubs [][]*subscription // don't make this a map, too expensive to iterate
 }
+
+// SublistFilter is a function that is used to decide if a subscription should
+// be returned by the Filter() call.
+type SublistFilter func(sub *subscription) bool
 
 // A Sublist stores and efficiently retrieves subscriptions.
 type Sublist struct {
@@ -122,6 +125,18 @@ func NewSublist(enableCache bool) *Sublist {
 	return &Sublist{root: newLevel()}
 }
 
+// NewSublistForServer will create a default sublist with caching enabled determined
+// by the server options.
+func NewSublistForServer(srv *Server) *Sublist {
+	if srv == nil {
+		return NewSublistNoCache() // Probably just unit tests.
+	}
+	if opts := srv.getOpts(); opts != nil {
+		return NewSublist(!opts.NoSublistCache)
+	}
+	return NewSublistNoCache()
+}
+
 // NewSublistWithCache will create a default sublist with caching enabled.
 func NewSublistWithCache() *Sublist {
 	return NewSublist(true)
@@ -164,7 +179,9 @@ func (s *Sublist) registerNotification(subject, queue string, notify chan<- bool
 	}
 
 	var hasInterest bool
-	r := s.Match(subject)
+	// Match under the lock so a concurrent insert or remove can't be missed.
+	s.Lock()
+	r := s.matchNoLock(subject)
 
 	if len(r.psubs)+len(r.qsubs) > 0 {
 		if queue == _EMPTY_ {
@@ -188,7 +205,6 @@ func (s *Sublist) registerNotification(subject, queue string, notify chan<- bool
 	key := keyFromSubjectAndQueue(subject, queue)
 	var err error
 
-	s.Lock()
 	if s.notify == nil {
 		s.notify = &notifyMaps{
 			insert: make(map[string][]chan<- bool),
@@ -357,16 +373,6 @@ func (s *Sublist) chkForRemoveNotification(subject, queue string) {
 func (s *Sublist) Insert(sub *subscription) error {
 	// copy the subject since we hold this and this might be part of a large byte slice.
 	subject := string(sub.subject)
-	tsa := [32]string{}
-	tokens := tsa[:0]
-	start := 0
-	for i := 0; i < len(subject); i++ {
-		if subject[i] == btsep {
-			tokens = append(tokens, subject[start:i])
-			start = i + 1
-		}
-	}
-	tokens = append(tokens, subject[start:])
 
 	s.Lock()
 
@@ -374,7 +380,7 @@ func (s *Sublist) Insert(sub *subscription) error {
 	var n *node
 	l := s.root
 
-	for _, t := range tokens {
+	for t := range strings.SplitSeq(subject, tsep) {
 		lt := len(t)
 		if lt == 0 || sfwc {
 			s.Unlock()
@@ -637,9 +643,10 @@ func (s *Sublist) hasInterest(subject string, doLock bool, np, nq *int) bool {
 	if doLock {
 		s.RLock()
 	}
-	var matched bool
+	var matched, ok bool
 	if s.cache != nil {
-		if r, ok := s.cache[subject]; ok {
+		var r *SublistResult
+		if r, ok = s.cache[subject]; ok {
 			if np != nil && nq != nil {
 				*np += len(r.psubs)
 				for _, qsub := range r.qsubs {
@@ -652,9 +659,9 @@ func (s *Sublist) hasInterest(subject string, doLock bool, np, nq *int) bool {
 	if doLock {
 		s.RUnlock()
 	}
-	if matched {
+	if ok {
 		atomic.AddUint64(&s.cacheHits, 1)
-		return true
+		return matched
 	}
 
 	tsa := [32]string{}
@@ -827,7 +834,9 @@ func matchLevelForAny(l *level, toks []string, np, nq *int) bool {
 				*nq += len(qsub)
 			}
 		}
-		return len(n.plist) > 0 || len(n.psubs) > 0 || len(n.qsubs) > 0
+		if len(n.plist) > 0 || len(n.psubs) > 0 || len(n.qsubs) > 0 {
+			return true
+		}
 	}
 	if pwc != nil {
 		if np != nil && nq != nil {
@@ -851,16 +860,6 @@ type lnt struct {
 // Raw low level remove, can do batches with lock held outside.
 func (s *Sublist) remove(sub *subscription, shouldLock bool, doCacheUpdates bool) error {
 	subject := string(sub.subject)
-	tsa := [32]string{}
-	tokens := tsa[:0]
-	start := 0
-	for i := 0; i < len(subject); i++ {
-		if subject[i] == btsep {
-			tokens = append(tokens, subject[start:i])
-			start = i + 1
-		}
-	}
-	tokens = append(tokens, subject[start:])
 
 	if shouldLock {
 		s.Lock()
@@ -875,7 +874,7 @@ func (s *Sublist) remove(sub *subscription, shouldLock bool, doCacheUpdates bool
 	var lnts [32]lnt
 	levels := lnts[:0]
 
-	for _, t := range tokens {
+	for t := range strings.SplitSeq(subject, tsep) {
 		lt := len(t)
 		if lt == 0 || sfwc {
 			return ErrInvalidSubject
@@ -995,6 +994,9 @@ func (n *node) isEmpty() bool {
 
 // Return the number of nodes for the given level.
 func (l *level) numNodes() int {
+	if l == nil {
+		return 0
+	}
 	num := len(l.nodes)
 	if l.pwc != nil {
 		num++
@@ -1227,8 +1229,7 @@ func isValidSubject(subject string, checkRunes bool) bool {
 		}
 	}
 	sfwc := false
-	tokens := strings.Split(subject, tsep)
-	for _, t := range tokens {
+	for t := range strings.SplitSeq(subject, tsep) {
 		length := len(t)
 		if length == 0 || sfwc {
 			return false
@@ -1251,12 +1252,12 @@ func isValidSubject(subject string, checkRunes bool) bool {
 
 // IsValidLiteralSubject returns true if a subject is valid and literal (no wildcards), false otherwise
 func IsValidLiteralSubject(subject string) bool {
-	return isValidLiteralSubject(strings.Split(subject, tsep))
+	return isValidLiteralSubject(strings.SplitSeq(subject, tsep))
 }
 
 // isValidLiteralSubject returns true if the tokens are valid and literal (no wildcards), false otherwise
-func isValidLiteralSubject(tokens []string) bool {
-	for _, t := range tokens {
+func isValidLiteralSubject(tokens iter.Seq[string]) bool {
+	for t := range tokens {
 		if len(t) == 0 {
 			return false
 		}
@@ -1276,9 +1277,8 @@ func ValidateMapping(src string, dest string) error {
 	if dest == _EMPTY_ {
 		return nil
 	}
-	subjectTokens := strings.Split(dest, tsep)
 	sfwc := false
-	for _, t := range subjectTokens {
+	for t := range strings.SplitSeq(dest, tsep) {
 		length := len(t)
 		if length == 0 || sfwc {
 			return &mappingDestinationErr{t, ErrInvalidMappingDestinationSubject}
@@ -1293,6 +1293,8 @@ func ValidateMapping(src string, dest string) error {
 				!sliceFromLeftMappingFunctionRegEx.MatchString(t) &&
 				!sliceFromRightMappingFunctionRegEx.MatchString(t) &&
 				!splitMappingFunctionRegEx.MatchString(t) &&
+				!leftMappingFunctionRegEx.MatchString(t) &&
+				!rightMappingFunctionRegEx.MatchString(t) &&
 				!randomMappingFunctionRegEx.MatchString(t) {
 				return &mappingDestinationErr{t, ErrUnknownMappingDestinationFunction}
 			} else {
@@ -1345,8 +1347,9 @@ func SubjectsCollide(subj1, subj2 string) bool {
 	if subj1 == subj2 {
 		return true
 	}
-	toks1 := strings.Split(subj1, tsep)
-	toks2 := strings.Split(subj2, tsep)
+	tsa, tsb := [32]string{}, [32]string{}
+	toks1 := tokenizeSubjectIntoSlice(tsa[:0], subj1)
+	toks2 := tokenizeSubjectIntoSlice(tsb[:0], subj2)
 	pwc1, fwc1 := analyzeTokens(toks1)
 	pwc2, fwc2 := analyzeTokens(toks2)
 	// if both literal just string compare.
@@ -1356,9 +1359,9 @@ func SubjectsCollide(subj1, subj2 string) bool {
 	}
 	// So one or both have wildcards. If one is literal than we can do subset matching.
 	if l1 && !l2 {
-		return isSubsetMatch(toks1, subj2)
+		return isSubsetMatchTokenized(toks1, toks2)
 	} else if l2 && !l1 {
-		return isSubsetMatch(toks2, subj1)
+		return isSubsetMatchTokenized(toks2, toks1)
 	}
 	// Both have wildcards.
 	// If they only have partials then the lengths must match.
@@ -1621,39 +1624,59 @@ func (s *Sublist) localSubs(subs *[]*subscription, includeLeafHubs bool) {
 // All is used to collect all subscriptions.
 func (s *Sublist) All(subs *[]*subscription) {
 	s.RLock()
-	s.collectAllSubs(s.root, subs)
+	s.collectAllSubs(s.root, subs, nil)
 	s.RUnlock()
 }
 
-func (s *Sublist) addAllNodeToSubs(n *node, subs *[]*subscription) {
+func (s *Sublist) Filter(subs *[]*subscription, filter SublistFilter) {
+	s.RLock()
+	s.collectAllSubs(s.root, subs, filter)
+	s.RUnlock()
+}
+
+func (s *Sublist) addAllNodeToSubs(n *node, subs *[]*subscription, filter SublistFilter) {
 	// Normal subscriptions
 	if n.plist != nil {
-		*subs = append(*subs, n.plist...)
+		if filter == nil {
+			*subs = append(*subs, n.plist...)
+		} else {
+			for _, sub := range n.plist {
+				if filter(sub) {
+					*subs = append(*subs, sub)
+				}
+			}
+		}
 	} else {
 		for sub := range n.psubs {
+			if filter != nil && !filter(sub) {
+				continue
+			}
 			*subs = append(*subs, sub)
 		}
 	}
 	// Queue subscriptions
 	for _, qr := range n.qsubs {
 		for sub := range qr {
+			if filter != nil && !filter(sub) {
+				continue
+			}
 			*subs = append(*subs, sub)
 		}
 	}
 }
 
-func (s *Sublist) collectAllSubs(l *level, subs *[]*subscription) {
+func (s *Sublist) collectAllSubs(l *level, subs *[]*subscription, filter SublistFilter) {
 	for _, n := range l.nodes {
-		s.addAllNodeToSubs(n, subs)
-		s.collectAllSubs(n.next, subs)
+		s.addAllNodeToSubs(n, subs, filter)
+		s.collectAllSubs(n.next, subs, filter)
 	}
 	if l.pwc != nil {
-		s.addAllNodeToSubs(l.pwc, subs)
-		s.collectAllSubs(l.pwc.next, subs)
+		s.addAllNodeToSubs(l.pwc, subs, filter)
+		s.collectAllSubs(l.pwc.next, subs, filter)
 	}
 	if l.fwc != nil {
-		s.addAllNodeToSubs(l.fwc, subs)
-		s.collectAllSubs(l.fwc.next, subs)
+		s.addAllNodeToSubs(l.fwc, subs, filter)
+		s.collectAllSubs(l.fwc.next, subs, filter)
 	}
 }
 
@@ -1742,55 +1765,5 @@ func getAllNodes(l *level, results *SublistResult) {
 	for _, n := range l.nodes {
 		addNodeToResults(n, results)
 		getAllNodes(n.next, results)
-	}
-}
-
-// IntersectStree will match all items in the given subject tree that
-// have interest expressed in the given sublist. The callback will only be called
-// once for each subject, regardless of overlapping subscriptions in the sublist.
-func IntersectStree[T any](st *stree.SubjectTree[T], sl *Sublist, cb func(subj []byte, entry *T)) {
-	var _subj [255]byte
-	intersectStree(st, sl.root, _subj[:0], cb)
-}
-
-func intersectStree[T any](st *stree.SubjectTree[T], r *level, subj []byte, cb func(subj []byte, entry *T)) {
-	nsubj := subj
-	if len(nsubj) > 0 {
-		nsubj = append(subj, '.')
-	}
-	switch {
-	case r.fwc != nil:
-		// We've reached a full wildcard, do a FWC match on the stree at this point
-		// and don't keep iterating downward.
-		nsubj := append(nsubj, '>')
-		st.Match(nsubj, cb)
-	case r.pwc != nil:
-		// We've found a partial wildcard. We'll keep iterating downwards, but first
-		// check whether there's interest at this level (without triggering dupes) and
-		// match if so.
-		nsubj := append(nsubj, '*')
-		if len(r.pwc.psubs)+len(r.pwc.qsubs) > 0 {
-			st.Match(nsubj, cb)
-		}
-		if r.pwc.next != nil && r.pwc.next.numNodes() > 0 {
-			intersectStree(st, r.pwc.next, nsubj, cb)
-		}
-	default:
-		// Normal node with subject literals, keep iterating.
-		for t, n := range r.nodes {
-			nsubj := append(nsubj, t...)
-			if len(n.psubs)+len(n.qsubs) > 0 {
-				if subjectHasWildcard(bytesToString(nsubj)) {
-					st.Match(nsubj, cb)
-				} else {
-					if e, ok := st.Find(nsubj); ok {
-						cb(nsubj, e)
-					}
-				}
-			}
-			if n.next != nil && n.next.numNodes() > 0 {
-				intersectStree(st, n.next, nsubj, cb)
-			}
-		}
 	}
 }

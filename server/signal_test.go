@@ -1,4 +1,4 @@
-// Copyright 2012-2025 The NATS Authors
+// Copyright 2012-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -429,7 +429,7 @@ func TestProcessSignalTermDuringLameDuckMode(t *testing.T) {
 	opts := &Options{
 		Host:                "127.0.0.1",
 		Port:                -1,
-		NoSigs:              false,
+		NoSigs:              true,
 		NoLog:               true,
 		LameDuckDuration:    2 * time.Second,
 		LameDuckGracePeriod: 1 * time.Second,
@@ -463,7 +463,7 @@ func TestProcessSignalTermDuringLameDuckMode(t *testing.T) {
 
 	// Termination signal should not cause server to shutdown
 	// while in lame duck mode already.
-	syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+	s.handleSignal(syscall.SIGTERM)
 
 	// Wait for server shutdown due to lame duck shutdown.
 	timeoutCh := make(chan error)
@@ -482,6 +482,23 @@ func TestProcessSignalTermDuringLameDuckMode(t *testing.T) {
 			break
 		}
 	}
+}
+
+func TestSignalTermRightAfterLameDuckSignal(t *testing.T) {
+	if os.Getenv("IN_TEST") == "1" {
+		s := RunServer(&Options{Host: "127.0.0.1", Port: -1, NoSigs: true, NoLog: true})
+		defer s.Shutdown()
+		// Same calls the signal loop makes, without lame duck mode the SIGTERM would exit.
+		s.handleSignal(syscall.SIGUSR2)
+		s.handleSignal(syscall.SIGTERM)
+		require_True(t, s.isLameDuckMode())
+		return
+	}
+	// Run as separate process, an exit from the SIGTERM must fail the test.
+	cmd := exec.Command(os.Args[0], "-test.run=TestSignalTermRightAfterLameDuckSignal", "-test.paniconexit0")
+	cmd.Env = append(os.Environ(), "IN_TEST=1")
+	err := cmd.Run()
+	require_NoError(t, err)
 }
 
 func TestSignalInterruptHasSuccessfulExit(t *testing.T) {

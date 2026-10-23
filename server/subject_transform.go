@@ -1,4 +1,4 @@
-// Copyright 2023-2025 The NATS Authors
+// Copyright 2023-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,8 +17,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -378,7 +379,7 @@ func transformTokenize(subject string) string {
 	// We need to make the appropriate markers for the wildcards etc.
 	i := 1
 	var nda []string
-	for _, token := range strings.Split(subject, tsep) {
+	for token := range strings.SplitSeq(subject, tsep) {
 		if token == pwcs {
 			nda = append(nda, fmt.Sprintf("$%d", i))
 			i++
@@ -399,7 +400,7 @@ func transformUntokenize(subject string) (string, []string) {
 	var phs []string
 	var nda []string
 
-	for _, token := range strings.Split(subject, tsep) {
+	for token := range strings.SplitSeq(subject, tsep) {
 		if args := getMappingFunctionArgs(wildcardMappingFunctionRegEx, token); (len(token) > 1 && token[0] == '$' && token[1] >= '1' && token[1] <= '9') || (len(args) == 1 && args[0] != _EMPTY_) {
 			phs = append(phs, token)
 			nda = append(nda, pwcs)
@@ -439,7 +440,7 @@ func (tr *subjectTransform) Match(subject string) (string, error) {
 	tts := tokenizeSubject(subject)
 
 	// TODO(jnm): optimization -> not sure this is actually needed but was there in initial code
-	if !isValidLiteralSubject(tts) {
+	if !isValidLiteralSubject(slices.Values(tts)) {
 		return _EMPTY_, ErrBadSubject
 	}
 
@@ -462,7 +463,7 @@ func (tr *subjectTransform) getRandomPartition(ceiling int) string {
 		return "0"
 	}
 
-	return strconv.Itoa(int(rand.Int31()) % ceiling)
+	return strconv.Itoa(int(rand.Int32()) % ceiling)
 }
 
 func (tr *subjectTransform) getHashPartition(key []byte, numBuckets int) string {

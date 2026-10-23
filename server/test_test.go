@@ -1,4 +1,4 @@
-// Copyright 2019-2025 The NATS Authors
+// Copyright 2019-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,7 @@ package server
 import (
 	"cmp"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"reflect"
@@ -83,12 +83,24 @@ func require_NoError(t testing.TB, err error) {
 	}
 }
 
+// Must be used in a defer call.
+func require_NoPanic(t testing.TB) {
+	t.Helper()
+	if err := recover(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func require_NotNil[T any](t testing.TB, vs ...T) {
 	t.Helper()
 	for _, v := range vs {
 		r := reflect.ValueOf(v)
 		switch k := r.Kind(); k {
-		case reflect.Ptr, reflect.Interface, reflect.Slice,
+		// A nil interface value has no dynamic type, so reflect reports it as invalid.
+		case reflect.Invalid:
+			antithesis.AssertUnreachable(t, "Failed require_NotNil check", nil)
+			t.Fatalf("require not nil, but got nil")
+		case reflect.Pointer, reflect.Interface, reflect.Slice,
 			reflect.Map, reflect.Chan, reflect.Func:
 			if r.IsNil() {
 				antithesis.AssertUnreachable(t, "Failed require_NotNil check", nil)
@@ -381,4 +393,10 @@ func runSolicitLeafServerToURL(surl string) (*Server, *Options) {
 	o.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
 	o.LeafNode.ReconnectInterval = 100 * time.Millisecond
 	return RunServer(&o), &o
+}
+
+func skipIfBuildkite(t *testing.T) {
+	if os.Getenv("BUILDKITE") == "true" {
+		t.Skip("skipping test on Buildkite CI")
+	}
 }

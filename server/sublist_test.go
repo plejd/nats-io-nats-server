@@ -1,4 +1,4 @@
-// Copyright 2016-2025 The NATS Authors
+// Copyright 2016-2026 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"strconv"
@@ -26,7 +26,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server/stree"
 	"github.com/nats-io/nuid"
 )
 
@@ -118,6 +117,30 @@ func newRemoteQSub(subject, queue string, num int32) *subscription {
 func TestSublistInit(t *testing.T) {
 	s := NewSublistWithCache()
 	verifyCount(s, 0, t)
+}
+
+func TestSublistForServerNoOpts(t *testing.T) {
+	s := NewSublistForServer(&Server{})
+	if s == nil {
+		t.Fatal("Expected a sublist")
+	}
+	if s.CacheEnabled() {
+		t.Fatal("Expected cache to be disabled when server options are nil")
+	}
+}
+
+func TestSetAccountSublistNoOpts(t *testing.T) {
+	s := &Server{}
+	acc := NewAccount("foo")
+
+	s.setAccountSublist(acc)
+
+	if acc.sl == nil {
+		t.Fatal("Expected account sublist to be initialized")
+	}
+	if acc.sl.CacheEnabled() {
+		t.Fatal("Expected cache to be disabled when server options are nil")
+	}
 }
 
 func TestSublistInsertCount(t *testing.T) {
@@ -700,6 +723,15 @@ func TestValidateDestinationSubject(t *testing.T) {
 	checkError(ValidateMapping("*", "foo.{{partition(2,1)}}"), nil, t)
 	checkError(ValidateMapping("*.*", "foo.{{SplitFromLeft(2,1)}}"), nil, t)
 	checkError(ValidateMapping("*.*", "foo.{{SplitFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{SliceFromLeft(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{SliceFromRight(2,1)}}"), nil, t)
+	checkError(ValidateMapping("*.*", "foo.{{split(1,-)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{random(1)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{left(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{Left(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{right(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{Right(1,2)}}"), nil, t)
+	checkError(ValidateMapping("*", "foo.{{ left( 1 , 2 ) }}"), nil, t)
 	checkError(ValidateMapping("*", "foo.{{unknown(1)}}"), ErrInvalidMappingDestination, t)
 	checkError(ValidateMapping("foo", "foo..}"), ErrInvalidMappingDestination, t)
 	checkError(ValidateMapping("foo", "foo. bar}"), ErrInvalidMappingDestinationSubject, t)
@@ -1095,6 +1127,43 @@ func TestSublistAll(t *testing.T) {
 	if len(output) != len(subs) {
 		t.Fatalf("Expected %d for All, got %d", len(subs), len(output))
 	}
+}
+
+func TestSublistFilter(t *testing.T) {
+	s := NewSublistNoCache()
+	subs := []*subscription{
+		newSub("foo.bar.baz"),
+		newSub("foo.bar"),
+		newQSub("baz", "q1"),
+		newQSub("foo.bar", "q2"),
+	}
+	for _, sub := range subs {
+		s.Insert(sub)
+	}
+
+	check := func(expected int) {
+		t.Helper()
+		var buf [32]*subscription
+		output := buf[:0]
+		s.Filter(&output, func(sub *subscription) bool {
+			return string(sub.subject) != "foo.bar"
+		})
+		if len(output) != expected {
+			t.Fatalf("Expected %d for Filter, got %d", expected, len(output))
+		}
+		for _, sub := range output {
+			if string(sub.subject) == "foo.bar" {
+				t.Fatalf("The sub with subject `foo.bar` should not have been returned")
+			}
+		}
+	}
+	check(2)
+
+	// Add more subscriptions to get n.plist populated.
+	for range plistMin + 10 {
+		s.Insert(newSub("foo.baz"))
+	}
+	check(plistMin + 10 + 2)
 }
 
 func TestIsSubsetMatch(t *testing.T) {
@@ -1629,8 +1698,11 @@ func TestSublistHasInterest(t *testing.T) {
 	}
 
 	// Call Match on a subject we know there is no match.
+	hits := sl.cacheHits
 	sl.Match("bar")
 	require_False(t, sl.HasInterest("bar"))
+	// The sublist caches "negative" results as well, expect a cache hit.
+	require_Equal(t, sl.cacheHits, hits+1)
 
 	// Remove fooSub and check interest again
 	sl.Remove(fooSub)
@@ -1773,6 +1845,14 @@ func TestSublistHasInterest(t *testing.T) {
 	sl.Remove(qsub)
 }
 
+func TestSublistHasInterestOverlapping(t *testing.T) {
+	sl := NewSublistWithCache()
+	require_NoError(t, sl.Insert(newSub("stream.A.child")))
+	require_NoError(t, sl.Insert(newSub("stream.*")))
+	require_True(t, sl.HasInterest("stream.A.child"))
+	require_True(t, sl.HasInterest("stream.A"))
+}
+
 func TestSublistNumInterest(t *testing.T) {
 	sl := NewSublistWithCache()
 	fooSub := newSub("foo")
@@ -1802,8 +1882,11 @@ func TestSublistNumInterest(t *testing.T) {
 	}
 
 	// Call Match on a subject we know there is no match.
+	hits := sl.cacheHits
 	sl.Match("bar")
 	require_NumInterest(t, "bar", 0, 0)
+	// The sublist caches "negative" results as well, expect a cache hit.
+	require_Equal(t, sl.cacheHits, hits+1)
 
 	// Remove fooSub and check interest again
 	sl.Remove(fooSub)
@@ -1981,156 +2064,6 @@ func TestSublistNumInterest(t *testing.T) {
 	require_NumInterest(t, "foo", 0, 1)
 	require_NumInterest(t, "foo.bar", 0, 0)
 	sl.Remove(qsub)
-}
-
-func TestSublistInterestBasedIntersection(t *testing.T) {
-	st := stree.NewSubjectTree[struct{}]()
-	st.Insert([]byte("one.two.three.four"), struct{}{})
-	st.Insert([]byte("one.two.three.five"), struct{}{})
-	st.Insert([]byte("one.two.six"), struct{}{})
-	st.Insert([]byte("one.two.seven"), struct{}{})
-	st.Insert([]byte("eight.nine"), struct{}{})
-	st.Insert([]byte("stream.A"), struct{}{})
-	st.Insert([]byte("stream.A.child"), struct{}{})
-
-	require_NoDuplicates := func(t *testing.T, got map[string]int) {
-		t.Helper()
-		for _, c := range got {
-			require_Equal(t, c, 1)
-		}
-	}
-
-	t.Run("Literals", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one.two.six"))
-		sl.Insert(newSub("eight.nine"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("PWC", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one.two.*.*"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("PWCOverlapping", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one.two.*.four"))
-		sl.Insert(newSub("one.two.*.*"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("PWCAll", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("*.*"))
-		sl.Insert(newSub("*.*.*"))
-		sl.Insert(newSub("*.*.*.*"))
-		require_True(t, sl.HasInterest("foo.bar"))
-		require_True(t, sl.HasInterest("foo.bar.baz"))
-		require_True(t, sl.HasInterest("foo.bar.baz.qux"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 7)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWC", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one.>"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 4)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWCOverlapping", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one.two.three.four"))
-		sl.Insert(newSub("one.>"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 4)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWCExtended", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("stream.A.>"))
-		sl.Insert(newSub("stream.A"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 2)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("FWCAll", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub(">"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 7)
-		require_NoDuplicates(t, got)
-	})
-
-	t.Run("NoMatch", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 0)
-	})
-
-	t.Run("NoMatches", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("one"))
-		sl.Insert(newSub("eight"))
-		sl.Insert(newSub("ten"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 0)
-	})
-
-	t.Run("NoMatchPartial", func(t *testing.T) {
-		got := map[string]int{}
-		sl := NewSublistNoCache()
-		sl.Insert(newSub("stream.A.not-child"))
-		sl.Insert(newSub("stream.A.child.>"))
-		IntersectStree(st, sl, func(subj []byte, entry *struct{}) {
-			fmt.Println("Matched", string(subj))
-			got[string(subj)]++
-		})
-		require_Len(t, len(got), 0)
-		require_NoDuplicates(t, got)
-	})
 }
 
 func subsInit(pre string, toks []string) {
@@ -2459,7 +2392,7 @@ func cacheContentionTest(b *testing.B, numMatchers, numAdders, numRemovers int) 
 	// Removers
 	for i := 0; i < numRemovers; i++ {
 		go func() {
-			prand := rand.New(rand.NewSource(time.Now().UnixNano()))
+			prand := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
 			swg.Done()
 			swg.Wait()
 			for {
@@ -2470,7 +2403,7 @@ func cacheContentionTest(b *testing.B, numMatchers, numAdders, numRemovers int) 
 				default:
 					mu.RLock()
 					lh := len(subs) - 1
-					index := prand.Intn(lh)
+					index := prand.IntN(lh)
 					sub := subs[index]
 					mu.RUnlock()
 					s.Remove(sub)
@@ -2530,5 +2463,64 @@ func Benchmark______________IsValidLiteralSubject(b *testing.B) {
 func Benchmark___________________subjectIsLiteral(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		subjectIsLiteral("foo.bar.baz.22")
+	}
+}
+
+// Test to determine the fastest way to match a filter
+// with wildcards against a literal subject.
+func Benchmark_SubjectFilterMatchers(b *testing.B) {
+	cases := []struct {
+		name    string
+		subject string
+		filter  string
+		want    bool
+	}{
+		{
+			name:    "short_single_wc_match",
+			subject: "foo.baz.12345",
+			filter:  "foo.baz.*",
+			want:    true,
+		},
+		{
+			name:    "short_mixed_wc_match",
+			subject: "foo.baz.12345",
+			filter:  "foo.*.>",
+			want:    true,
+		},
+		{
+			name:    "long_single_wc_match",
+			subject: "foo.alpha.beta.gamma.delta.epsilon.zeta.12345",
+			filter:  "foo.alpha.beta.gamma.delta.epsilon.zeta.*",
+			want:    true,
+		},
+		{
+			name:    "long_many_wc_late_mismatch",
+			subject: "foo.alpha.beta.gamma.delta.epsilon.zeta.12345",
+			filter:  "foo.*.*.*.*.*.*.99999",
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.Run("subjectIsSubsetMatch", func(b *testing.B) {
+				var matched bool
+				for i := 0; i < b.N; i++ {
+					matched = subjectIsSubsetMatch(tc.subject, tc.filter)
+				}
+				if matched != tc.want {
+					b.Fatalf("unexpected result: got %v, want %v", matched, tc.want)
+				}
+			})
+			b.Run("matchLiteral", func(b *testing.B) {
+				var matched bool
+				for i := 0; i < b.N; i++ {
+					matched = matchLiteral(tc.subject, tc.filter)
+				}
+				if matched != tc.want {
+					b.Fatalf("unexpected result: got %v, want %v", matched, tc.want)
+				}
+			})
+		})
 	}
 }
