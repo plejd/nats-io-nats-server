@@ -86,7 +86,7 @@ type leaf struct {
 	// Used to suppress sub and unsub interest. Same as routes but our audience
 	// here is tied to this leaf node. This will hold all subscriptions except this
 	// leaf nodes. This represents all the interest we want to send to the other side.
-	smap map[string]int32
+	smap map[string]int64
 	// This map will contain all the subscriptions that have been added to the smap
 	// during initLeafNodeSmapAndSendSubs. It is short lived and is there to avoid
 	// race between processing of a sub where sub is added to account sublist but
@@ -220,6 +220,15 @@ func validateLeafNode(o *Options) error {
 				return fmt.Errorf("invalid deny_imports for remote %s: %w", r.safeName(), err)
 			}
 			if err := checkPermSubjectArray(r.DenyExports, false); err != nil {
+				return fmt.Errorf("invalid deny_exports for remote %s: %w", r.safeName(), err)
+			}
+			// The remote account is only known once the connection is established, but the
+			// local account is known, so everything else can be checked now.
+			pctx := subjectPlaceholderContext{account: r.LocalAccount, leafRemotePending: true}
+			if _, err := expandPermissionSubjectsPlaceholders(r.DenyImports, pctx); err != nil {
+				return fmt.Errorf("invalid deny_imports for remote %s: %w", r.safeName(), err)
+			}
+			if _, err := expandPermissionSubjectsPlaceholders(r.DenyExports, pctx); err != nil {
 				return fmt.Errorf("invalid deny_exports for remote %s: %w", r.safeName(), err)
 			}
 			rn := r.name()
@@ -494,6 +503,30 @@ func newLeafNodeCfg(remote *RemoteLeafOpts) *leafNodeCfg {
 		}
 	}
 	return cfg
+}
+
+// Returns the deny_exports and deny_imports of the remote configuration of this solicited connection
+// with the account scoped mapping functions (e.g. {{account-hash()}}) resolved into literal subjects.
+// The remote configuration is never modified. Until the remote account is learned from the hub's INFO,
+// {{account-hash-leaf-remote()}} is left untouched: the permissions are applied again at that point.
+// Lock is held on entry.
+func (c *client) leafRemoteDenyPermissions() *Permissions {
+	perms := c.leaf.remote.perms
+	if !permissionsHavePlaceholders(perms) {
+		return perms
+	}
+	pctx := subjectPlaceholderContext{
+		leafRemote:        c.leaf.remoteAccName,
+		leafRemotePending: c.leaf.remoteAccName == _EMPTY_,
+	}
+	if c.acc != nil {
+		pctx.account = c.acc.Name
+	}
+	perms, err := expandPermissionsPlaceholders(perms, pctx)
+	if err != nil {
+		c.Errorf("Error resolving leafnode deny permissions: %v", err)
+	}
+	return perms
 }
 
 // Notifies the quit channel without blocking.
@@ -1381,7 +1414,7 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 			s.Errorf("Unable to lookup account %s for solicited leafnode connection: %v", lacc, err)
 			return nil
 		}
-		remoteSuffix = fmt.Sprintf(" for account: %s", acc.traceLabel())
+		remoteSuffix = fmt.Sprintf(" for account: %s (%s)", acc.traceLabel(), rURL.Host)
 	}
 
 	c.mu.Lock()
@@ -1397,14 +1430,16 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 		solicited = true
 		remote.Lock()
 		c.leaf.remote = remote
-		c.setPermissions(remote.perms)
+		// Bind the account before applying the deny lists so that account scoped
+		// mapping functions (e.g. {{account-hash()}}) in them can be resolved.
+		c.acc = acc
+		c.setPermissions(c.leafRemoteDenyPermissions())
 		if !c.leaf.remote.Hub {
 			c.leaf.isSpoke = true
 		}
 		tlsFirst = remote.TLSHandshakeFirst
 		infoTimeout = remote.FirstInfoTimeout
 		remote.Unlock()
-		c.acc = acc
 	} else {
 		c.flags.set(expectConnect)
 		if ws != nil {
@@ -1800,25 +1835,35 @@ func (c *client) processLeafnodeInfo(info *Info) {
 		c.updateLeafNodeURLs(info)
 	}
 
+	if !firstINFO && didSolicit {
+		// Remember the remote account name before applying permissions so that
+		// account scoped mapping functions referring to it can be resolved.
+		c.leaf.remoteAccName = info.RemoteAccount
+	}
+
 	// Only solicited leafnode connections trust permission updates from INFO.
-	if didSolicit && (info.Import != nil || info.Export != nil) {
+	// Also re-apply the local deny lists once the remote account is known if they refer to it.
+	if didSolicit && (info.Import != nil || info.Export != nil ||
+		(info.RemoteAccount != _EMPTY_ && c.leaf.remote != nil && permissionsHavePlaceholders(c.leaf.remote.perms))) {
 		perms := &Permissions{
 			Publish:   info.Export,
 			Subscribe: info.Import,
 		}
 		// Check if we have local deny clauses that we need to merge.
-		if remote := c.leaf.remote; remote != nil {
-			if len(remote.DenyExports) > 0 {
-				if perms.Publish == nil {
-					perms.Publish = &SubjectPermission{}
+		if c.leaf.remote != nil {
+			if deny := c.leafRemoteDenyPermissions(); deny != nil {
+				if deny.Publish != nil {
+					if perms.Publish == nil {
+						perms.Publish = &SubjectPermission{}
+					}
+					perms.Publish.Deny = append(perms.Publish.Deny, deny.Publish.Deny...)
 				}
-				perms.Publish.Deny = append(perms.Publish.Deny, remote.DenyExports...)
-			}
-			if len(remote.DenyImports) > 0 {
-				if perms.Subscribe == nil {
-					perms.Subscribe = &SubjectPermission{}
+				if deny.Subscribe != nil {
+					if perms.Subscribe == nil {
+						perms.Subscribe = &SubjectPermission{}
+					}
+					perms.Subscribe.Deny = append(perms.Subscribe.Deny, deny.Subscribe.Deny...)
 				}
-				perms.Subscribe.Deny = append(perms.Subscribe.Deny, remote.DenyImports...)
 			}
 		}
 		c.setPermissions(perms)
@@ -1832,8 +1877,6 @@ func (c *client) processLeafnodeInfo(info *Info) {
 		// Clear deadline that was set in createLeafNode while waiting for the INFO.
 		c.nc.SetDeadline(time.Time{})
 		resumeConnect = true
-	} else if !firstINFO && didSolicit {
-		c.leaf.remoteAccName = info.RemoteAccount
 	}
 
 	// Check if we have the remote account information and if so make sure it's stored.
@@ -2422,7 +2465,19 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	c.setFirstPingTimer()
 
 	// If we received pub deny permissions from the other end, merge with existing ones.
-	c.mergeDenyPermissions(pub, proto.DenyPub)
+	// These are the remote's deny_imports: resolve account scoped mapping functions from its perspective.
+	denyPub := proto.DenyPub
+	if len(denyPub) > 0 && c.acc != nil {
+		var err error
+		denyPub, err = expandPermissionSubjectsPlaceholders(proto.DenyPub, subjectPlaceholderContext{
+			account:    proto.RemoteAccount,
+			leafRemote: c.acc.Name,
+		})
+		if err != nil {
+			c.Errorf("Error resolving leafnode deny permissions: %v", err)
+		}
+	}
+	c.mergeDenyPermissions(pub, denyPub)
 
 	acc := c.acc
 	c.mu.Unlock()
@@ -2640,7 +2695,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 
 	// Now walk the results and add them to our smap
 	rc := c.leaf.remoteCluster
-	c.leaf.smap = make(map[string]int32)
+	c.leaf.smap = make(map[string]int64)
 	for _, sub := range subs {
 		// Don't advertise interest from leafnodes to this isolated leafnode connection.
 		if isIsolated && (sub.client.kind == LEAF || sub.leaf) {
@@ -2655,9 +2710,9 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 		// Also don't add the subscription if it has a origin cluster and the
 		// cluster name matches the one of the client we are sending to.
 		if c != sub.client && (sub.origin == nil || (bytesToString(sub.origin) != rc)) {
-			count := int32(1)
+			count := int64(1)
 			if len(sub.queue) > 0 && sub.qw > 0 {
-				count = sub.qw
+				count = int64(sub.qw)
 			}
 			c.leaf.smap[keyFromSub(sub)] += count
 			if c.leaf.tsub == nil {
@@ -2852,8 +2907,9 @@ func (c *client) updateSmap(sub *subscription, delta int32, isLDS bool) {
 	}
 
 	// We will update if its a queue, if count is zero (or negative), or we were 0 and are N > 0.
-	update := sub.queue != nil || (n <= 0 && n+delta > 0) || (n > 0 && n+delta <= 0)
-	n += delta
+	d := int64(delta)
+	update := sub.queue != nil || (n <= 0 && n+d > 0) || (n > 0 && n+d <= 0)
+	n += d
 	if n > 0 {
 		c.leaf.smap[key] = n
 	} else {
@@ -2905,7 +2961,7 @@ func (c *client) forceRemoveFromSmap(subj string) {
 
 // Send the subscription interest change to the other side.
 // Lock should be held.
-func (c *client) sendLeafNodeSubUpdate(key string, n int32) {
+func (c *client) sendLeafNodeSubUpdate(key string, n int64) {
 	// If we are a spoke, we need to check if we are allowed to send this subscription over to the hub.
 	if c.isSpokeLeafNode() {
 		checkPerms := true
@@ -2991,7 +3047,7 @@ func keyFromSubWithOrigin(sub *subscription) string {
 }
 
 // Lock should be held.
-func (c *client) writeLeafSub(w *bytes.Buffer, key string, n int32) {
+func (c *client) writeLeafSub(w *bytes.Buffer, key string, n int64) {
 	if key == _EMPTY_ {
 		return
 	}
@@ -3002,13 +3058,14 @@ func (c *client) writeLeafSub(w *bytes.Buffer, key string, n int32) {
 			w.WriteString(" ")
 			var b [12]byte
 			var i = len(b)
-			for l := n; l > 0; l /= 10 {
+			qw := queueWeight(n)
+			for l := qw; l > 0; l /= 10 {
 				i--
 				b[i] = digits[l%10]
 			}
 			w.Write(b[i:])
 			if c.trace {
-				arg := fmt.Sprintf("%s %d", key, n)
+				arg := fmt.Sprintf("%s %d", key, qw)
 				c.traceOutOp("LS+", []byte(arg))
 			}
 		} else if c.trace {
@@ -3047,14 +3104,12 @@ func (c *client) processLeafSub(argo []byte) (err error) {
 	case 3:
 		sub.queue = args[1]
 		sub.qw = int32(parseSize(args[2]))
-		// TODO: (ik) We should have a non empty queue name and a queue
-		// weight >= 1. For 2.11, we may want to return an error if that
-		// is not the case, but for now just overwrite `delta` if queue
-		// weight is greater than 1 (it is possible after a reconnect/
-		// server restart to receive a queue weight > 1 for a new sub).
-		if sub.qw > 1 {
-			delta = sub.qw
+		// A missing or malformed weight counts as a single member.
+		if sub.qw < 1 {
+			sub.qw = 1
 		}
+		// A new sub can have a weight > 1 after a reconnect or server restart.
+		delta = sub.qw
 	default:
 		return fmt.Errorf("processLeafSub Parse Error: '%s'", arg)
 	}
@@ -3420,6 +3475,12 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 		return
 	}
 
+	// A leafnode only speaks for the account it's bound to.
+	// The system account is trusted to speak for others, like for JetStream API requests.
+	if len(c.pa.reply) > 0 && c.pa.hdr > 0 && acc != srv.SystemAccount() {
+		msg = c.bindLeafClientInfoHeader(acc, msg)
+	}
+
 	// Match the subscriptions. We will use our own L1 map if
 	// it's still valid, avoiding contention on the shared sublist.
 	var r *SublistResult
@@ -3557,7 +3618,7 @@ func (c *client) leafSendAllowed(bsubject []byte) bool {
 	}
 
 	allowed := true
-	if perms.Allow != nil && !strings.HasPrefix(subject, mqttPrefix) {
+	if perms.Allow != nil {
 		allowed = false
 		for _, allowSubj := range perms.Allow {
 			if matchLiteral(subject, allowSubj) {

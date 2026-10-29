@@ -1083,6 +1083,10 @@ func (c *client) updateDefaultPermissions(perms *Permissions) bool {
 	if c.user == nil || !c.user.defaultPerms {
 		return false
 	}
+	// A leafnode's perms are set up at connect, like on config reload.
+	if c.kind == LEAF {
+		return false
+	}
 	if perms == nil {
 		c.user.Permissions = nil
 		c.perms = nil
@@ -2114,16 +2118,25 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 		if c.kind == LEAF || c.kind == ROUTER || c.kind == GATEWAY {
 			var tags []string
 			var remoteName string
+			var remoteURL *url.URL
 			switch {
 			case c.kind == LEAF && c.leaf != nil:
 				remoteName = c.leaf.remoteServer
+				if c.leaf.remote != nil {
+					remoteURL = c.leaf.remote.getCurrentURL()
+				}
 			case c.kind == ROUTER && c.route != nil:
 				remoteName = c.route.remoteName
+				remoteURL = c.route.url
 			case c.kind == GATEWAY && c.gw != nil:
 				remoteName = c.gw.remoteName
+				remoteURL = c.gw.connectURL
 			}
 			if remoteName != _EMPTY_ {
 				tags = append(tags, fmt.Sprintf("Remote: %s", remoteName))
+			}
+			if remoteURL != nil {
+				tags = append(tags, fmt.Sprintf("Host: %s", remoteURL.Host))
 			}
 			if len(tags) > 0 {
 				c.Noticef("%s connection closed: %s - %s", c.kindString(), reason, strings.Join(tags, ", "))
@@ -3425,11 +3438,11 @@ func (c *client) canSubscribeInternal(subject string, optQueue ...string) bool {
 	}
 
 	// For CLIENT connections that are MQTT we will implicitly allow anything that starts with
-	// the "$MQTT.sub." or "$MQTT.deliver.pubrel." prefix. For other types of connections, we
+	// the "$MQTT.sub." or "$MQTT.deliver.pubrel." prefix. For other non-LEAF connections, we
 	// will implicitly allow anything that starts with the full "$MQTT." prefix. However,
 	// we don't just return here, we skip the check for "allow" but will check "deny".
 	if (c.isMqtt() && (strings.HasPrefix(subject, mqttSubPrefix) || strings.HasPrefix(subject, mqttPubRelDeliverySubjectPrefix))) ||
-		(c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix)) {
+		(c.kind != CLIENT && c.kind != LEAF && strings.HasPrefix(subject, mqttPrefix)) {
 		checkAllow = false
 	}
 	// Check allow list. If no allow list that means all are allowed. Deny can overrule.
@@ -3475,6 +3488,11 @@ func (c *client) canSubscribe(subject string, optQueue ...string) bool {
 // an exact queue subscription, can overlap a deny entry. Assumes caller is
 // holding the write lock.
 func (c *client) loadMsgDenyFilterIfNeeded(subject string, hasQueue bool) {
+	// A solicited leafnode's subscribe denies only limit what we receive.
+	// Deliveries to it are checked against its publish perms in deliverMsg().
+	if c.isSolicitedLeafNode() {
+		return
+	}
 	// We use the actual subscription to signal us to spin up the deny mperms
 	// and cache. We check if the subject is a wildcard that intersects any of
 	// the deny clauses.
@@ -4284,10 +4302,10 @@ func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bo
 		return v.(bool)
 	}
 	allowed, checkAllow := true, true
-	// For any connections, other than CLIENT, we will implicitly allow anything that
+	// For any connections, other than CLIENT and LEAF, we will implicitly allow anything that
 	// starts with the "$MQTT." prefix. However, we don't just return here,
 	// we skip the check for "allow" but will check "deny".
-	if c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix) {
+	if c.kind != CLIENT && c.kind != LEAF && strings.HasPrefix(subject, mqttPrefix) {
 		checkAllow = false
 	}
 	// Cache miss, check allow then deny as needed.
@@ -4351,6 +4369,12 @@ func isServiceReply(reply []byte) bool {
 // Test whether a subject is a JetStream ACK.
 func isJSAckSubject(subject []byte) bool {
 	return len(subject) > jsAckPreLen && bytesToString(subject[:jsAckPreLen]) == jsAckPre
+}
+
+// Test whether a message is a JetStream pull request, either directly or with an ack.
+func isJSPullRequest(subject string, payload []byte) bool {
+	return strings.HasPrefix(subject, jsRequestNextPre) ||
+		(isJSAckSubject(stringToBytes(subject)) && bytes.HasPrefix(payload, AckNext))
 }
 
 // jsAckDeliverIdx returns the byte offset of the `@` separator in an encoded
@@ -5080,6 +5104,9 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			// Fast batch requires knowledge of the original reply subject.
 			if bytes.HasSuffix(c.pa.reply, []byte(FastBatchSuffix)) {
 				ci.Reply = bytesToString(c.pa.reply)
+			} else if ci != nil && len(c.pa.reply) > 0 && isJSPullRequest(to, msg[max(c.pa.hdr, 0):]) {
+				// So do pull requests, for a consumer leader on another server to track the requester's interest.
+				ci.Reply = bytesToString(c.pa.reply)
 			}
 			// If we did not share but the imports destination is the system account add in the server and cluster info.
 			if !share && isSysImport {
@@ -5602,12 +5629,20 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 		var rsub, sub *subscription
 		var _ql [32]*subscription
 
+		// Weighted remote qsubs are at the front of the queue group.
+		var nw int
+		if i < len(r.qwn) {
+			nw = r.qwn[i]
+		}
+
 		src := c.kind
 		// If we just came from a route we want to prefer local subs.
 		// So only select from local subs but remember the first rsub
 		// in case all else fails.
 		if src == ROUTER {
 			ql := _ql[:0]
+			// Total queue weight of the rsub candidates seen so far.
+			var lw uint64
 			for i := 0; i < len(qsubs); i++ {
 				sub = qsubs[i]
 				if dst := sub.client.kind; dst == LEAF || dst == ROUTER {
@@ -5620,12 +5655,14 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 					// If we have assigned a ROUTER rsub already, replace if
 					// the destination is a LEAF since we want to favor that.
 					if rsub == nil || (rsub.client.kind == ROUTER && dst == LEAF) {
-						rsub = sub
+						rsub, lw = sub, qsubWeight(sub)
 					} else if dst == LEAF {
 						// We already have a LEAF and this is another one.
-						// Flip a coin to see if we swap it or not.
+						// Swap it with a chance relative to its queue weight.
 						// See https://github.com/nats-io/nats-server/issues/6040
-						if rand.Uint32()%2 == 1 {
+						w := qsubWeight(sub)
+						lw += w
+						if rand.Uint64N(lw) < w {
 							rsub = sub
 						}
 					}
@@ -5633,13 +5670,14 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, deliver,
 					ql = append(ql, sub)
 				}
 			}
-			qsubs = ql
+			// Only local subs remain, which all have weight 1.
+			qsubs, nw = ql, 0
 		}
 
 		sindex := 0
 		lqs := len(qsubs)
 		if lqs > 1 {
-			sindex = int(rand.Uint32() % uint32(lqs))
+			sindex = weightedQSubIndex(qsubs, nw)
 		}
 
 		// Find a subscription that is able to deliver this message starting at a random index.
@@ -5903,6 +5941,26 @@ func (c *client) checkLeafClientInfoHeader(msg []byte) (dmsg []byte, setHdr bool
 	return dmsg, setHdr
 }
 
+// Bind a client info header received from a leafnode to the account of the leafnode connection.
+func (c *client) bindLeafClientInfoHeader(acc *Account, msg []byte) []byte {
+	if c.pa.hdr < 0 || len(msg) < c.pa.hdr {
+		return msg
+	}
+	cir := sliceHeader(ClientInfoHdr, msg[:c.pa.hdr])
+	if len(cir) == 0 {
+		return msg
+	}
+	var ci ClientInfo
+	if err := json.Unmarshal(cir, &ci); err != nil || ci.Account == acc.Name {
+		return msg
+	}
+	ci.Account = acc.Name
+	if b, _ := json.Marshal(ci); b != nil {
+		msg = c.setHeader(ClientInfoHdr, bytesToString(b), msg)
+	}
+	return msg
+}
+
 func (c *client) pubPermissionViolation(subject []byte) {
 	errTxt := fmt.Sprintf("Permissions Violation for Publish to %q", subject)
 	if mt, _ := c.isMsgTraceEnabled(); mt != nil {
@@ -5959,6 +6017,9 @@ func (c *client) processPingTimer() {
 	if c.kind == ROUTER && opts.Cluster.PingInterval > 0 {
 		pingInterval = opts.Cluster.PingInterval
 	}
+	if c.kind == LEAF && opts.LeafNode.PingInterval > 0 {
+		pingInterval = opts.LeafNode.PingInterval
+	}
 	if c.isWebsocket() && opts.Websocket.PingInterval > 0 {
 		pingInterval = opts.Websocket.PingInterval
 	}
@@ -5984,6 +6045,9 @@ func (c *client) processPingTimer() {
 		maxPingsOut := opts.MaxPingsOut
 		if c.kind == ROUTER && opts.Cluster.MaxPingsOut > 0 {
 			maxPingsOut = opts.Cluster.MaxPingsOut
+		}
+		if c.kind == LEAF && opts.LeafNode.MaxPingsOut > 0 {
+			maxPingsOut = opts.LeafNode.MaxPingsOut
 		}
 		if c.ping.out+1 > maxPingsOut {
 			c.Debugf("Stale Client Connection - Closing")
@@ -6043,6 +6107,9 @@ func (c *client) setPingTimer() {
 	d := opts.PingInterval
 	if c.kind == ROUTER && opts.Cluster.PingInterval > 0 {
 		d = opts.Cluster.PingInterval
+	}
+	if c.kind == LEAF && opts.LeafNode.PingInterval > 0 {
+		d = opts.LeafNode.PingInterval
 	}
 	if c.isWebsocket() && opts.Websocket.PingInterval > 0 {
 		d = opts.Websocket.PingInterval
@@ -6215,10 +6282,17 @@ func (c *client) swapAccountAfterReload() {
 func (c *client) processSubsOnConfigReload(awcsti map[string]struct{}) {
 	c.mu.Lock()
 	var (
-		checkPerms = c.perms != nil
+		// A leafnode's subscribe perms only limit what we receive, not the remote's interest.
+		checkPerms = c.perms != nil && c.kind != LEAF
 		checkAcc   = c.acc != nil
 		acc        = c.acc
 	)
+	if checkAcc {
+		// We actually only want to check if stream imports have changed.
+		if _, ok := awcsti[acc.Name]; !ok {
+			checkAcc = false
+		}
+	}
 	if !checkPerms && !checkAcc {
 		c.mu.Unlock()
 		return
@@ -6230,24 +6304,22 @@ func (c *client) processSubsOnConfigReload(awcsti map[string]struct{}) {
 		removed  = _removed[:0]
 		srv      = c.srv
 	)
-	if checkAcc {
-		// We actually only want to check if stream imports have changed.
-		if _, ok := awcsti[acc.Name]; !ok {
-			checkAcc = false
-		}
-	}
 	// We will clear any mperms we have here. It will rebuild on the fly with canSubscribe,
 	// so we do that here as we collect them. We will check result down below.
-	c.mperms = nil
+	if checkPerms {
+		c.mperms = nil
+	}
 	// Collect client's subs under the lock
 	for _, sub := range c.subs {
 		// Just checking to rebuild mperms under the lock, will collect removed though here.
 		// Only collect under subs array of canSubscribe and checkAcc true.
-		var allowed bool
-		if len(sub.queue) > 0 {
-			allowed = c.canSubscribe(string(sub.subject), string(sub.queue))
-		} else {
-			allowed = c.canSubscribe(string(sub.subject))
+		allowed := true
+		if checkPerms {
+			if len(sub.queue) > 0 {
+				allowed = c.canSubscribe(string(sub.subject), string(sub.queue))
+			} else {
+				allowed = c.canSubscribe(string(sub.subject))
+			}
 		}
 		if !allowed {
 			removed = append(removed, sub)
@@ -7131,6 +7203,9 @@ func (c *client) setFirstPingTimer() {
 
 	if c.kind == ROUTER && opts.Cluster.PingInterval > 0 {
 		d = opts.Cluster.PingInterval
+	}
+	if c.kind == LEAF && opts.LeafNode.PingInterval > 0 {
+		d = opts.LeafNode.PingInterval
 	}
 	if c.isWebsocket() && opts.Websocket.PingInterval > 0 {
 		d = opts.Websocket.PingInterval

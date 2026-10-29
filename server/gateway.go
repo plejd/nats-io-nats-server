@@ -185,7 +185,7 @@ type srvGateway struct {
 // Subject interest tally. Also indicates if the key in the map is a
 // queue or not.
 type sitally struct {
-	n int32 // number of subscriptions directly matching
+	n int64 // number of subscriptions directly matching
 	q bool  // indicate that this is a queue
 }
 
@@ -204,7 +204,7 @@ type gatewayCfg struct {
 type gateway struct {
 	name       string
 	cfg        *gatewayCfg
-	connectURL *url.URL          // Needed when sending CONNECT after receiving INFO from remote
+	connectURL *url.URL          // URL used to solicit this outbound connection (used for CONNECT and logging)
 	outsim     *sync.Map         // Per-account subject interest (or no-interest) (outbound conn)
 	insim      map[string]*insie // Per-account subject no-interest sent or modeInterestOnly mode (inbound conn)
 
@@ -815,7 +815,7 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 		// the remote's INFO protocol, save the URL we need to connect to.
 		c.gw.connectURL = url
 
-		c.Noticef("Creating outbound gateway connection to %q", cfgName)
+		c.Noticef("Creating outbound gateway connection to %q (%s)", cfgName, url.Host)
 	} else {
 		c.flags.set(expectConnect)
 		// Inbound gateway connection
@@ -940,7 +940,6 @@ func (c *client) sendGatewayConnect(opts *Options) {
 	tlsRequired := c.gw.cfg.TLSConfig != nil
 	c.gw.cfg.RUnlock()
 	url := c.gw.connectURL
-	c.gw.connectURL = nil
 	var user, pass string
 	if userInfo := url.User; userInfo != nil {
 		user = userInfo.Username()
@@ -1863,6 +1862,12 @@ func (s *Server) GatewayAddr() *net.TCPAddr {
 func (c *client) processGatewayAccountUnsub(accName string) {
 	// Just to indicate activity around "subscriptions" events.
 	c.in.subs++
+	// Receiving an A- on an inbound connection is a protocol violation.
+	if !c.gw.outbound {
+		c.Errorf("Received A- from gateway on inbound connection")
+		c.closeConnection(ProtocolViolation)
+		return
+	}
 	// This account may have an entry because of queue subs.
 	// If that's the case, we can reset the no-interest map,
 	// but not set the entry to nil.
@@ -1892,6 +1897,12 @@ func (c *client) processGatewayAccountUnsub(accName string) {
 func (c *client) processGatewayAccountSub(accName string) error {
 	// Just to indicate activity around "subscriptions" events.
 	c.in.subs++
+	// Receiving an A+ on an inbound connection is a protocol violation.
+	if !c.gw.outbound {
+		c.Errorf("Received A+ from gateway on inbound connection")
+		c.closeConnection(ProtocolViolation)
+		return nil
+	}
 	// If this account has an entry because of queue subs, we
 	// can't delete the entry.
 	remove := true
@@ -2420,11 +2431,11 @@ func (s *Server) gatewayUpdateSubInterest(accName string, sub *subscription, cha
 		if change < 0 {
 			return
 		}
-		entry = &sitally{n: change, q: sub.queue != nil}
+		entry = &sitally{n: int64(change), q: sub.queue != nil}
 		st[string(key)] = entry
 		first = true
 	} else {
-		entry.n += change
+		entry.n += int64(change)
 		if entry.n <= 0 {
 			delete(st, bytesToString(key))
 			last = true
@@ -3063,6 +3074,14 @@ func (c *client) processInboundGatewayMsg(msg []byte) {
 
 	// Mostly under testing scenarios.
 	if c.srv == nil {
+		return
+	}
+
+	// Messages are only expected on inbound connections. Receiving an RMSG
+	// on an outbound connection is a protocol violation.
+	if c.gw.outbound {
+		c.Errorf("Received RMSG from gateway on outbound connection")
+		c.closeConnection(ProtocolViolation)
 		return
 	}
 

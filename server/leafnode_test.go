@@ -592,6 +592,49 @@ func TestLeafNodeRTT(t *testing.T) {
 	checkRTT(t, sb)
 }
 
+func TestLeafNodeCustomPing(t *testing.T) {
+	pingInterval := 50 * time.Millisecond
+
+	ob := DefaultOptions()
+	ob.LeafNode.Host = "127.0.0.1"
+	ob.LeafNode.Port = -1
+	ob.LeafNode.PingInterval = pingInterval
+	ob.LeafNode.MaxPingsOut = 2
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	lnBURL, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", ob.LeafNode.Port))
+	oa := DefaultOptions()
+	oa.Cluster.Name = "xyz"
+	oa.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{lnBURL}}}
+	oa.LeafNode.PingInterval = pingInterval
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	checkLeafNodeConnected(t, sa)
+
+	var ln *client
+	sa.mu.Lock()
+	for _, l := range sa.leafs {
+		ln = l
+		break
+	}
+	sa.mu.Unlock()
+
+	ch := make(chan struct{}, 1)
+	ln.mu.Lock()
+	ln.nc = &capturePingConn{ln.nc, ch}
+	ln.mu.Unlock()
+
+	for i := 0; i < 5; i++ {
+		select {
+		case <-ch:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("Did not send PING")
+		}
+	}
+}
+
 func TestLeafNodeValidateAuthOptions(t *testing.T) {
 	opts := DefaultOptions()
 	opts.LeafNode.Username = "user1"
@@ -5167,7 +5210,7 @@ func TestLeafNodeQueueGroupWeightCorrectOnConnectionCloseInSuperCluster(t *testi
 	checkLeafNodeConnectedCount(t, sb2, 2)
 
 	// Helper to check that the interest is propagated to all servers
-	checkInterest := func(t *testing.T, expected []int, expectedGW int32) {
+	checkInterest := func(t *testing.T, expected []int, expectedGW int64) {
 		t.Helper()
 		subj := "foo"
 		for i, s := range []*Server{sa1, sa2, so1, so2, sb1, sb2, sc, sd} {
@@ -5196,7 +5239,7 @@ func TestLeafNodeQueueGroupWeightCorrectOnConnectionCloseInSuperCluster(t *testi
 				s.gateway.pasi.Lock()
 				accMap := s.gateway.pasi.m
 				st := accMap["USER"]
-				var n int32
+				var n int64
 				entry, ok := st["foo bar"]
 				if ok {
 					n = entry.n
@@ -5949,6 +5992,190 @@ func TestLeafNodeRoutedSubKeyDifferentBetweenLeafSubAndRoutedSub(t *testing.T) {
 			})
 		})
 	}
+}
+
+// Connects a raw leaf to the given port, sends the given protocol and waits for the PONG.
+func createRawLeafConn(t *testing.T, port int, proto string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	nc, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	require_NoError(t, err)
+	t.Cleanup(func() { nc.Close() })
+	br := bufio.NewReader(nc)
+	nc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer nc.SetReadDeadline(time.Time{})
+	_, err = br.ReadString('\n')
+	require_NoError(t, err)
+	_, err = nc.Write([]byte("CONNECT {\"verbose\":false,\"pedantic\":false}\r\n" + proto + "PING\r\n"))
+	require_NoError(t, err)
+	for {
+		l, err := br.ReadString('\n')
+		require_NoError(t, err)
+		if strings.HasPrefix(l, "PONG") {
+			return nc, br
+		}
+	}
+}
+
+// Runs a two server hub cluster with leafnode listeners and optionally a gateway.
+func createHubClusterWithLeafListeners(t *testing.T, gateway bool) (*Server, *Server, *Options) {
+	t.Helper()
+	conf := `
+		server_name: %s
+		listen: "127.0.0.1:-1"
+		cluster {
+			name: HUB
+			listen: "127.0.0.1:-1"
+			%s
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+		%s
+	`
+	var gw string
+	if gateway {
+		gw = `gateway { name: HUB, listen: "127.0.0.1:-1" }
+		accounts { SYS {} }
+		system_account: SYS`
+	}
+	s1Conf := createConfFile(t, []byte(fmt.Sprintf(conf, "S1", _EMPTY_, gw)))
+	s1, s1Opts := RunServerWithConfig(s1Conf)
+	t.Cleanup(s1.Shutdown)
+
+	s2Conf := createConfFile(t, []byte(fmt.Sprintf(conf, "S2",
+		fmt.Sprintf("routes: [\"nats://127.0.0.1:%d\"]", s1Opts.Cluster.Port), gw)))
+	s2, _ := RunServerWithConfig(s2Conf)
+	t.Cleanup(s2.Shutdown)
+
+	checkClusterFormed(t, s1, s2)
+	return s1, s2, s1Opts
+}
+
+func TestLeafNodeQueueWeightRoutedMsgPicksLeafByWeight(t *testing.T) {
+	s1, s2, _ := createHubClusterWithLeafListeners(t, false)
+
+	// Two leafs on s2 with queue weights 9 and 1, and no local queue members.
+	port := s2.getOpts().LeafNode.Port
+	var received [2]atomic.Int64
+	for i, proto := range []string{"LS+ foo Q1 9\r\n", "LS+ foo Q1 1\r\n"} {
+		_, br := createRawLeafConn(t, port, proto)
+		go func() {
+			for {
+				l, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if strings.HasPrefix(l, "LMSG ") {
+					received[i].Add(1)
+				}
+			}
+		}()
+	}
+
+	// s1 sees the combined weight from s2 over the route.
+	checkSubInterest(t, s1, globalAccountName, "foo", time.Second)
+
+	// Messages published on s1 reach s2 over the route, where a leaf is picked by weight.
+	nc := natsConnect(t, s1.ClientURL())
+	defer nc.Close()
+	const n = 2000
+	for range n {
+		natsPub(t, nc, "foo", []byte("x"))
+	}
+	natsFlush(t, nc)
+
+	checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+		if total := received[0].Load() + received[1].Load(); total != n {
+			return fmt.Errorf("expected %d messages, got %d", n, total)
+		}
+		return nil
+	})
+	if pct := float64(received[0].Load()) / n; pct < 0.85 || pct > 0.95 {
+		t.Fatalf("Expected the leaf with weight 9 to get ~90%%, got %.2f%%", pct*100)
+	}
+}
+
+func TestLeafNodeQueueWeightOverflowKeepsRouteInterest(t *testing.T) {
+	s1, s2, s1Opts := createHubClusterWithLeafListeners(t, true)
+
+	leafConn := func(proto string) net.Conn {
+		t.Helper()
+		nc, _ := createRawLeafConn(t, s1Opts.LeafNode.Port, proto)
+		return nc
+	}
+
+	// Returns the weight total s1 tracks for the gateway queue interest.
+	gatewayWeight := func(subj string) int64 {
+		s1.gateway.pasi.Lock()
+		defer s1.gateway.pasi.Unlock()
+		if entry, ok := s1.gateway.pasi.m[globalAccountName][subj+" Q1"]; ok {
+			return entry.n
+		}
+		return 0
+	}
+
+	// Returns the weight total s1 tracks for the leaf queue interest.
+	totalWeight := func(subj string) int64 {
+		key := keyFromSubWithOrigin(&subscription{leaf: true, subject: []byte(subj), queue: []byte("Q1")})
+		acc := s1.GlobalAccount()
+		acc.mu.RLock()
+		defer acc.mu.RUnlock()
+		return acc.rm[key]
+	}
+
+	// Returns the weight s2 received from s1 for the leaf queue interest.
+	routeWeight := func(subj string) (qw int32, found bool) {
+		s2.forEachRoute(func(r *client) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			for _, sub := range r.subs {
+				if sub.leaf && string(sub.subject) == subj && string(sub.queue) == "Q1" {
+					qw, found = atomic.LoadInt32(&sub.qw), true
+				}
+			}
+		})
+		return qw, found
+	}
+
+	checkWeights := func(subj string, total int64, expected int32) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 20*time.Millisecond, func() error {
+			if n := totalWeight(subj); n != total {
+				return fmt.Errorf("expected total weight %d, got %d", total, n)
+			}
+			if n := gatewayWeight(subj); n != total {
+				return fmt.Errorf("expected gateway weight %d, got %d", total, n)
+			}
+			qw, found := routeWeight(subj)
+			if expected == 0 && found {
+				return fmt.Errorf("expected no route interest, got weight %d", qw)
+			} else if expected > 0 && qw != expected {
+				return fmt.Errorf("expected route weight %d, got %d (found=%v)", expected, qw, found)
+			}
+			return nil
+		})
+	}
+
+	// The total stays exact past int32 and the parseable weight limit, peers get the max weight.
+	var conns []net.Conn
+	for i := int64(1); i <= 3; i++ {
+		conns = append(conns, leafConn("LS+ foo Q1 999999999\r\n"))
+		checkWeights("foo", i*maxQueueWeight, maxQueueWeight)
+	}
+
+	// Interest is kept until the last leaf is gone.
+	for i := int64(2); i >= 0; i-- {
+		conns[i].Close()
+		expected := int32(maxQueueWeight)
+		if i == 0 {
+			expected = 0
+		}
+		checkWeights("foo", i*maxQueueWeight, expected)
+	}
+
+	// A malformed weight counts as a single member.
+	leafConn("LS+ bar Q1 1234567890\r\n")
+	checkWeights("bar", 1, 1)
 }
 
 func TestLeafNodeQueueGroupWithLateLNJoin(t *testing.T) {
@@ -10435,6 +10662,295 @@ func TestLeafNodeQueueScopedImportDenyFiltersBroadQueueInterest(t *testing.T) {
 	require_Equal(t, "exact blocked", string(msg.Data))
 }
 
+// A remote's deny_imports only limits what the leaf receives from the hub, and
+// deny_exports only what it sends. Replies to a hub requester must not be dropped
+// when interest on either side overlaps an import deny.
+func TestLeafNodeDenyImportsDoesNotDropRepliesToHub(t *testing.T) {
+	// In each case a single kind of interest overlaps the deny. All but the first use the
+	// old request style, so the hub's reply inbox is literal and doesn't overlap it.
+	for _, test := range []struct {
+		name            string
+		oldRequestStyle bool
+		hubQueue        bool
+		leafWildcard    bool
+	}{
+		// The hub requester's response inbox (_INBOX.<id>.*) overlaps the deny.
+		{"hub wildcard inbox", false, false, false},
+		// A hub queue sub on a literal subject overlaps the deny.
+		{"hub queue sub", true, true, false},
+		// A leaf wildcard sub overlaps the deny.
+		{"leaf wildcard sub", true, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hconf := createConfFile(t, []byte(`
+				server_name: "HUB"
+				listen: "127.0.0.1:-1"
+				leafnodes {
+					listen: "127.0.0.1:-1"
+				}
+			`))
+			hub, ohub := RunServerWithConfig(hconf)
+			defer hub.Shutdown()
+
+			lconf := createConfFile(t, []byte(fmt.Sprintf(`
+				server_name: "LEAF"
+				listen: "127.0.0.1:-1"
+				leafnodes {
+					remotes: [
+						{ url: "nats://127.0.0.1:%d", deny_imports: ["_INBOX.>"], deny_exports: ["out.secret"] }
+					]
+				}
+			`, ohub.LeafNode.Port)))
+			leaf, _ := RunServerWithConfig(lconf)
+			defer leaf.Shutdown()
+
+			checkLeafNodeConnected(t, hub)
+			checkLeafNodeConnected(t, leaf)
+
+			var opts []nats.Option
+			if test.oldRequestStyle {
+				opts = append(opts, nats.UseOldRequestStyle())
+			}
+			ncHub := natsConnect(t, hub.ClientURL(), opts...)
+			defer ncHub.Close()
+			out := natsSubSync(t, ncHub, "out.*")
+			if test.hubQueue {
+				natsQueueSubSync(t, ncHub, "_INBOX.queue", "q")
+			}
+			natsFlush(t, ncHub)
+			checkSubInterest(t, leaf, globalAccountName, "out.public", time.Second)
+			if test.hubQueue {
+				checkSubInterest(t, leaf, globalAccountName, "_INBOX.queue", time.Second)
+			}
+
+			ncLeaf := natsConnect(t, leaf.ClientURL())
+			defer ncLeaf.Close()
+			natsSub(t, ncLeaf, "svc", func(m *nats.Msg) {
+				m.Respond([]byte("OK"))
+			})
+			var wildcard *nats.Subscription
+			if test.leafWildcard {
+				wildcard = natsSubSync(t, ncLeaf, ">")
+			}
+			denied := natsSubSync(t, ncLeaf, "_INBOX.leaf")
+			natsFlush(t, ncLeaf)
+			checkSubInterest(t, hub, globalAccountName, "svc", time.Second)
+
+			resp, err := ncHub.Request("svc", []byte("hello"), 2*time.Second)
+			require_NoError(t, err)
+			require_Equal(t, "OK", string(resp.Data))
+
+			// The export deny still applies to what the leaf sends.
+			natsPub(t, ncLeaf, "out.secret", nil)
+			natsPub(t, ncLeaf, "out.public", nil)
+			natsFlush(t, ncLeaf)
+			require_Equal(t, "out.public", natsNexMsg(t, out, time.Second).Subject)
+
+			// The import deny still keeps _INBOX traffic from the hub off the leaf.
+			natsPub(t, ncHub, "_INBOX.leaf", nil)
+			natsFlush(t, ncHub)
+			if _, err := denied.NextMsg(100 * time.Millisecond); err != nats.ErrTimeout {
+				t.Fatalf("Expected _INBOX.leaf to be denied by deny_imports, got %v", err)
+			}
+			// The wildcard sub also gets the leaf's own traffic, but not _INBOX.leaf.
+			for wildcard != nil {
+				msg, err := wildcard.NextMsg(100 * time.Millisecond)
+				if err == nats.ErrTimeout {
+					break
+				}
+				require_NoError(t, err)
+				if msg.Subject == "_INBOX.leaf" {
+					t.Fatalf("Expected _INBOX.leaf to be denied by deny_imports for the wildcard sub")
+				}
+			}
+		})
+	}
+}
+
+// A leafnode's subs hold the remote's interest. An account update on either side must
+// not remove it based on the leafnode's subscribe perms.
+func TestLeafNodeAccountUpdateKeepsRemoteInterest(t *testing.T) {
+	sysKp, sysPub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(sysPub), sysPub)
+	sysCreds := newUser(t, sysKp)
+
+	_, expPub := createKey(t)
+	expClaim := jwt.NewAccountClaims(expPub)
+	expClaim.Exports.Add(&jwt.Export{Subject: "feed", Type: jwt.Stream})
+	expJwt := encodeClaim(t, expClaim, expPub)
+
+	aKp, aPub := createKey(t)
+	aClaim := jwt.NewAccountClaims(aPub)
+	aJwt := encodeClaim(t, aClaim, aPub)
+	aCreds := newUser(t, aKp)
+
+	// The leaf user may receive anything, but may not publish "events".
+	ukp, _ := nkeys.CreateUser()
+	seed, _ := ukp.Seed()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Subject = upub
+	uclaim.Pub.Deny.Add("events")
+	ujwt, err := uclaim.Encode(aKp)
+	require_NoError(t, err)
+	leafCreds := genCredsFile(t, ujwt, seed)
+
+	tmpl := `
+		server_name: %s
+		listen: "127.0.0.1:-1"
+		operator: %s
+		system_account: %s
+		resolver: MEMORY
+		resolver_preload: {
+			%s: %s
+			%s: %s
+			%s: %s
+		}
+		leafnodes {
+			%s
+		}
+	`
+	conf := func(name, leafnodes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(tmpl, name, ojwt, sysPub,
+			sysPub, sysJwt, expPub, expJwt, aPub, aJwt, leafnodes)))
+	}
+	hub, ohub := RunServerWithConfig(conf("HUB", `listen: "127.0.0.1:-1"`))
+	defer hub.Shutdown()
+
+	leaf, _ := RunServerWithConfig(conf("LEAF", fmt.Sprintf(`
+		remotes: [
+			{ url: "nats://127.0.0.1:%d", account: %s, credentials: '%s', deny_imports: ["_INBOX.>"] }
+		]
+	`, ohub.LeafNode.Port, aPub, leafCreds)))
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	ncLeaf := natsConnect(t, leaf.ClientURL(), nats.UserCredentials(aCreds))
+	defer ncLeaf.Close()
+	natsSub(t, ncLeaf, "svc", func(m *nats.Msg) {
+		m.Respond([]byte("OK"))
+	})
+	sub := natsSubSync(t, ncLeaf, "events")
+	natsFlush(t, ncLeaf)
+	checkSubInterest(t, hub, aPub, "svc", time.Second)
+	checkSubInterest(t, hub, aPub, "events", time.Second)
+
+	ncHub := natsConnect(t, hub.ClientURL(), nats.UserCredentials(aCreds))
+	defer ncHub.Close()
+
+	check := func() {
+		t.Helper()
+		// The leaf holds the hub requester's _INBOX interest, overlapping deny_imports.
+		resp, err := ncHub.Request("svc", []byte("hello"), 2*time.Second)
+		require_NoError(t, err)
+		require_Equal(t, "OK", string(resp.Data))
+
+		// The hub holds the leaf's interest in "events", which the leaf user may not publish.
+		natsPub(t, ncHub, "events", nil)
+		natsFlush(t, ncHub)
+		natsNexMsg(t, sub, time.Second)
+	}
+	check()
+
+	// Adding a stream import reprocesses the subs of all connections in the account.
+	aClaim.Imports.Add(&jwt.Import{Subject: "feed", Account: expPub, Type: jwt.Stream})
+	aJwt = encodeClaim(t, aClaim, aPub)
+	for _, s := range []*Server{hub, leaf} {
+		ncSys := natsConnect(t, s.ClientURL(), nats.UserCredentials(sysCreds))
+		msg, err := ncSys.Request(fmt.Sprintf(accUpdateEventSubjNew, aPub), []byte(aJwt), time.Second)
+		ncSys.Close()
+		require_NoError(t, err)
+		require_Contains(t, string(msg.Data), "jwt updated")
+	}
+	check()
+}
+
+func TestLeafNodeAccountDefaultPermsUpdateKeepsLeafPerms(t *testing.T) {
+	sysKp, sysPub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(sysPub), sysPub)
+	sysCreds := newUser(t, sysKp)
+
+	// Users without perms of their own may only receive "feed" and send "up".
+	aKp, aPub := createKey(t)
+	aClaim := jwt.NewAccountClaims(aPub)
+	aClaim.DefaultPermissions.Sub.Allow.Add("feed")
+	aClaim.DefaultPermissions.Pub.Allow.Add("up")
+	aJwt := encodeClaim(t, aClaim, aPub)
+
+	userCreds := func(allowAll bool) string {
+		ukp, _ := nkeys.CreateUser()
+		seed, _ := ukp.Seed()
+		upub, _ := ukp.PublicKey()
+		uclaim := newJWTTestUserClaims()
+		uclaim.Subject = upub
+		if allowAll {
+			uclaim.Pub.Allow.Add(">")
+			uclaim.Sub.Allow.Add(">")
+		}
+		ujwt, err := uclaim.Encode(aKp)
+		require_NoError(t, err)
+		return genCredsFile(t, ujwt, seed)
+	}
+	leafCreds := userCreds(false)
+	clientCreds := userCreds(true)
+
+	tmpl := `
+		server_name: %s
+		listen: "127.0.0.1:-1"
+		operator: %s
+		system_account: %s
+		resolver: MEMORY
+		resolver_preload: {
+			%s: %s
+			%s: %s
+		}
+		leafnodes {
+			%s
+		}
+	`
+	conf := func(name, leafnodes string) string {
+		return createConfFile(t, []byte(fmt.Sprintf(tmpl, name, ojwt, sysPub,
+			sysPub, sysJwt, aPub, aJwt, leafnodes)))
+	}
+	hub, ohub := RunServerWithConfig(conf("HUB", `listen: "127.0.0.1:-1"`))
+	defer hub.Shutdown()
+
+	leaf, _ := RunServerWithConfig(conf("LEAF", fmt.Sprintf(`
+		remotes: [
+			{ url: "nats://127.0.0.1:%d", account: %s, credentials: '%s' }
+		]
+	`, ohub.LeafNode.Port, aPub, leafCreds)))
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	ncLeaf := natsConnect(t, leaf.ClientURL(), nats.UserCredentials(clientCreds))
+	defer ncLeaf.Close()
+	sub := natsSubSync(t, ncLeaf, "feed")
+	natsFlush(t, ncLeaf)
+	checkSubInterest(t, hub, aPub, "feed", time.Second)
+
+	ncHub := natsConnect(t, hub.ClientURL(), nats.UserCredentials(clientCreds))
+	defer ncHub.Close()
+	natsPub(t, ncHub, "feed", nil)
+	natsNexMsg(t, sub, time.Second)
+
+	// Changing the default perms must not reset the leaf's reversed perms.
+	aClaim.DefaultPermissions.Pub.Allow.Add("up2")
+	aJwt = encodeClaim(t, aClaim, aPub)
+	ncSys := natsConnect(t, hub.ClientURL(), nats.UserCredentials(sysCreds))
+	defer ncSys.Close()
+	msg, err := ncSys.Request(fmt.Sprintf(accUpdateEventSubjNew, aPub), []byte(aJwt), time.Second)
+	require_NoError(t, err)
+	require_Contains(t, string(msg.Data), "jwt updated")
+
+	natsPub(t, ncHub, "feed", nil)
+	natsNexMsg(t, sub, time.Second)
+}
+
 func TestLeafNodePermissionWithGateways(t *testing.T) {
 	usConf := createConfFile(t, []byte(`
 		server_name: "US"
@@ -13499,6 +14015,183 @@ func TestLeafNodePermsWithImportSubjectTransformGatewayRouted(t *testing.T) {
 	}
 }
 
+func TestLeafNodeDenyAccountFunctions(t *testing.T) {
+	hconf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		accounts { HUB { users [ {user: hub, password: pwd} ] } }
+		leafnodes { listen: 127.0.0.1:-1 }
+	`))
+	hub, hopts := RunServerWithConfig(hconf)
+	defer hub.Shutdown()
+
+	sconf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		accounts { SPOKE { users [ {user: spoke, password: pwd} ] } }
+		leafnodes {
+			remotes [ {
+				url: "nats://hub:pwd@127.0.0.1:%d"
+				account: SPOKE
+				deny_exports: [ "export.{{account-hash()}}", "export.{{account-hash-leaf-remote()}}" ]
+				deny_imports: [ "import.{{account-hash()}}", "import.{{account-hash-leaf-remote()}}" ]
+			} ]
+		}
+	`, hopts.LeafNode.Port)))
+	spoke, _ := RunServerWithConfig(sconf)
+	defer spoke.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, spoke)
+
+	hubHash, spokeHash := getHash("HUB"), getHash("SPOKE")
+
+	leafClient := func(s *Server) *client {
+		t.Helper()
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		for _, c := range s.leafs {
+			return c
+		}
+		t.Fatalf("No leafnode connection on %s", s.Name())
+		return nil
+	}
+	denies := func(c *client, pub bool, subject string) bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.perms == nil {
+			return false
+		}
+		sl := c.perms.sub.deny
+		if pub {
+			sl = c.perms.pub.deny
+		}
+		return sl != nil && sl.HasInterest(subject)
+	}
+
+	// The spoke resolves its own account right away and the hub's account once it is known.
+	sc := leafClient(spoke)
+	checkFor(t, 2*time.Second, 25*time.Millisecond, func() error {
+		if !denies(sc, true, "export."+hubHash) {
+			return fmt.Errorf("deny_exports not yet resolved with the remote account")
+		}
+		return nil
+	})
+	require_True(t, denies(sc, true, "export."+spokeHash))
+	require_True(t, denies(sc, false, "import."+spokeHash))
+	require_True(t, denies(sc, false, "import."+hubHash))
+	require_False(t, denies(sc, true, "export.{{account-hash()}}"))
+
+	// The hub receives the spoke's deny_imports and resolves them from the spoke's perspective.
+	hc := leafClient(hub)
+	checkFor(t, 2*time.Second, 25*time.Millisecond, func() error {
+		if !denies(hc, true, "import."+spokeHash) || !denies(hc, true, "import."+hubHash) {
+			return fmt.Errorf("deny_imports not yet resolved on the hub")
+		}
+		return nil
+	})
+
+	// Message flow: exports denied by the spoke never reach the hub.
+	ncHub := natsConnect(t, hub.ClientURL(), nats.UserInfo("hub", "pwd"))
+	defer ncHub.Close()
+	ncSpoke := natsConnect(t, spoke.ClientURL(), nats.UserInfo("spoke", "pwd"))
+	defer ncSpoke.Close()
+
+	hubSub := natsSubSync(t, ncHub, "export.>")
+	natsFlush(t, ncHub)
+	checkSubInterest(t, spoke, "SPOKE", "export.>", time.Second)
+	natsPub(t, ncSpoke, "export."+spokeHash, []byte("denied"))
+	natsPub(t, ncSpoke, "export."+hubHash, []byte("denied"))
+	natsPub(t, ncSpoke, "export.other", []byte("ok"))
+	m := natsNexMsg(t, hubSub, time.Second)
+	require_Equal(t, m.Subject, "export.other")
+	if m, err := hubSub.NextMsg(100 * time.Millisecond); err == nil {
+		t.Fatalf("Did not expect to receive %q", m.Subject)
+	}
+
+	// And denied imports never reach the spoke.
+	spokeSub := natsSubSync(t, ncSpoke, "import.>")
+	natsFlush(t, ncSpoke)
+	checkSubInterest(t, hub, "HUB", "import.>", time.Second)
+	natsPub(t, ncHub, "import."+spokeHash, []byte("denied"))
+	natsPub(t, ncHub, "import."+hubHash, []byte("denied"))
+	natsPub(t, ncHub, "import.other", []byte("ok"))
+	m = natsNexMsg(t, spokeSub, time.Second)
+	require_Equal(t, m.Subject, "import.other")
+	if m, err := spokeSub.NextMsg(100 * time.Millisecond); err == nil {
+		t.Fatalf("Did not expect to receive %q", m.Subject)
+	}
+}
+
+func TestLeafNodeDenyAccountFunctionsConfigErrors(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		leafnodes {
+			remotes [ { url: "nats://127.0.0.1:1234", deny_imports: [ "x.{{account-hash(a,b)}}" ] } ]
+		}
+	`))
+	opts, err := ProcessConfigFile(conf)
+	require_NoError(t, err)
+	require_Error(t, validateLeafNode(opts), ErrMappingDestinationTooManyArgs)
+
+	// The import function never applies to a leafnode deny list, while the leaf remote
+	// function is only resolved once connected and passes validation.
+	conf = createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		leafnodes {
+			remotes [ { url: "nats://127.0.0.1:1234", deny_exports: [ "x.{{account-hash-leaf-remote()}}", "x.{{account-hash-import()}}" ] } ]
+		}
+	`))
+	opts, err = ProcessConfigFile(conf)
+	require_NoError(t, err)
+	err = validateLeafNode(opts)
+	require_Error(t, err, ErrMappingFunctionNotAvailable)
+	require_Contains(t, err.Error(), "{{account-hash-import()}}")
+}
+
+func TestLeafNodeRemoteDenyPermissionsAccountFunctions(t *testing.T) {
+	s := RunServer(DefaultOptions())
+	defer s.Shutdown()
+	l := &captureErrorLogger{errCh: make(chan string, 1)}
+	s.SetLogger(l, false, false)
+
+	perms := &Permissions{Publish: &SubjectPermission{Deny: []string{"deny.{{account-hash-leaf-remote()}}", "deny.{{account-hash()}}"}}}
+	hash := getHash(s.globalAccount().Name)
+
+	// Accepted (hub side) connection: these are the permissions of the leafnode user, in which
+	// account scoped mapping functions are not resolved.
+	c := &client{srv: s, kind: LEAF, leaf: &leaf{}, acc: s.globalAccount()}
+	c.mu.Lock()
+	c.setPermissions(perms)
+	require_False(t, c.perms.pub.deny.HasInterest("deny."+hash))
+	require_True(t, c.perms.pub.deny.HasInterest("deny.{{account-hash()}}"))
+	require_True(t, c.perms.pub.deny.HasInterest("deny.{{account-hash-leaf-remote()}}"))
+	c.mu.Unlock()
+
+	// Solicited (spoke side) connection: the deny lists of the remote configuration are resolved,
+	// the remote account one being deferred until the hub's INFO, without error.
+	c = &client{srv: s, kind: LEAF, leaf: &leaf{remote: &leafNodeCfg{perms: perms}}, acc: s.globalAccount()}
+	c.mu.Lock()
+	c.setPermissions(c.leafRemoteDenyPermissions())
+	c.mu.Unlock()
+	select {
+	case e := <-l.errCh:
+		t.Fatalf("Unexpected error: %s", e)
+	case <-time.After(100 * time.Millisecond):
+	}
+	c.mu.Lock()
+	require_True(t, c.perms.pub.deny.HasInterest("deny."+hash))
+	require_True(t, c.perms.pub.deny.HasInterest("deny.{{account-hash-leaf-remote()}}"))
+	// Once the remote account is known, applying the permissions again resolves it.
+	c.leaf.remoteAccName = "REMOTE"
+	c.setPermissions(c.leafRemoteDenyPermissions())
+	require_True(t, c.perms.pub.deny.HasInterest("deny."+getHash("REMOTE")))
+	require_False(t, c.perms.pub.deny.HasInterest("deny.{{account-hash-leaf-remote()}}"))
+	c.mu.Unlock()
+
+	// The remote configuration is left untouched.
+	require_Equal(t, perms.Publish.Deny[0], "deny.{{account-hash-leaf-remote()}}")
+	require_Equal(t, perms.Publish.Deny[1], "deny.{{account-hash()}}")
+}
+
 func TestLeafNodeAccountLeafListReleasesClosedConnections(t *testing.T) {
 	o := DefaultOptions()
 	o.LeafNode.Host = "127.0.0.1"
@@ -14235,4 +14928,100 @@ func TestLeafNodeInterestLeakOnGatewayClose(t *testing.T) {
 	natsFlush(t, nca)
 	checkSubInterest(t, ln, globalAccountName, "barrier", time.Second)
 	require_NoError(t, checkInterest(false))
+}
+
+func TestLeafNodeLogsRemoteURL(t *testing.T) {
+	o1 := DefaultOptions()
+	o1.LeafNode.Host = "127.0.0.1"
+	o1.LeafNode.Port = -1
+	o1.LeafNode.Username = remoteURLLogUser
+	o1.LeafNode.Password = remoteURLLogPassword
+	s1 := RunServer(o1)
+	defer s1.Shutdown()
+
+	leafHost := fmt.Sprintf("localhost:%d", o1.LeafNode.Port)
+	o2 := DefaultOptions()
+	o2.Cluster.Name = _EMPTY_
+	o2.Cluster.Port = 0
+	o2.LeafNode.resolver = &localhostResolver{}
+	u := &url.URL{Scheme: "nats-leaf", Host: leafHost, User: url.UserPassword(remoteURLLogUser, remoteURLLogPassword)}
+	o2.LeafNode.Remotes = []*RemoteLeafOpts{{URLs: []*url.URL{u}}}
+	s2, l := runServerWithNoticeLogger(t, o2)
+	defer s2.Shutdown()
+
+	checkLeafNodeConnected(t, s2)
+	checkNoticeContains(t, l, "Leafnode connection created for account: $G ("+leafHost+")")
+
+	s1.Shutdown()
+	checkNoticeContains(t, l, "Leafnode connection closed: "+ClientClosed.String()+" - Remote: "+s1.Name()+", Host: "+leafHost)
+	s2.Shutdown()
+	checkNoticeNotContains(t, l, remoteURLLogUser, remoteURLLogPassword)
+}
+
+// A leafnode can send a pull request with an _R_ reply and its own Nats-Request-Info.
+// It may only speak for its own account, so the consumer must not track interest of another account.
+func TestLeafNodeJetStreamPullForgedRequestInfo(t *testing.T) {
+	conf := createConfFile(t, fmt.Appendf(nil, `
+		listen: 127.0.0.1:-1
+		jetstream: {max_mem_store: 64MB, max_file_store: 64MB, store_dir: %q}
+		accounts {
+			JS {
+				jetstream: enabled
+				users = [ { user: js, password: js }, { user: leaf, password: leaf } ]
+			}
+			V { users = [ { user: v, password: v } ] }
+		}
+		leafnodes { listen: 127.0.0.1:-1 }
+	`, t.TempDir()))
+	s, o := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s, nats.UserInfo("js", "js"))
+	defer nc.Close()
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", AckPolicy: nats.AckExplicitPolicy})
+	require_NoError(t, err)
+
+	// Another account has interest in a subject.
+	ncV := natsConnect(t, s.ClientURL(), nats.UserInfo("v", "v"))
+	defer ncV.Close()
+	natsSubSync(t, ncV, "victim.inbox")
+	natsFlush(t, ncV)
+
+	leafConn, err := net.DialTimeout("tcp", net.JoinHostPort(o.LeafNode.Host, fmt.Sprintf("%d", o.LeafNode.Port)), 2*time.Second)
+	require_NoError(t, err)
+	defer leafConn.Close()
+	_, err = bufio.NewReader(leafConn).ReadString('\n')
+	require_NoError(t, err)
+	_, err = leafConn.Write([]byte("CONNECT {\"name\":\"leaf\",\"user\":\"leaf\",\"pass\":\"leaf\",\"headers\":true}\r\nPING\r\n"))
+	require_NoError(t, err)
+	checkLeafNodeConnected(t, s)
+
+	// The leafnode claims the request came from that account.
+	hdr := "NATS/1.0\r\n" + ClientInfoHdr + ": {\"acc\":\"V\",\"reply\":\"victim.inbox\"}\r\n\r\n"
+	req := `{"batch":1,"expires":30000000000}`
+	subj := fmt.Sprintf(JSApiRequestNextT, "TEST", "C")
+	_, err = fmt.Fprintf(leafConn, "HMSG %s _R_.forged %d %d\r\n%s%s\r\n", subj, len(hdr), len(hdr)+len(req), hdr, req)
+	require_NoError(t, err)
+
+	jsAcc, err := s.LookupAccount("JS")
+	require_NoError(t, err)
+	mset, err := jsAcc.lookupStream("TEST")
+	require_NoError(t, err)
+	oc := mset.lookupConsumer("C")
+	require_NotNil(t, oc)
+	checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+		oc.mu.RLock()
+		defer oc.mu.RUnlock()
+		if oc.waiting.len() != 1 {
+			return fmt.Errorf("expected 1 waiting pull request, got %d", oc.waiting.len())
+		}
+		return nil
+	})
+	oc.mu.RLock()
+	acc, interest := oc.waiting.head.acc.Name, oc.waiting.head.interest
+	oc.mu.RUnlock()
+	require_Equal(t, acc, "JS")
+	require_Equal(t, interest, "_R_.forged")
 }
